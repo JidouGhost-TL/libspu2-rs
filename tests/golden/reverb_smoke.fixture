@@ -1,0 +1,28 @@
+# Voice with reverb send enabled; work area 0x180000..0x1FFFFF.
+reset
+ram_file 5000 data/sine440_loop.bin
+reg 0 19A 80C0
+reg 0 2E0 000C
+reg 0 2E2 0000
+reg 0 33C 000F
+reg 0 194 0001
+reg 0 196 0000
+# reverb coefficients: 0.25 each (all-zero coefficients make reverb a PCM no-op)
+reg 0 774 2000
+reg 0 776 2000
+reg 0 778 2000
+reg 0 77A 2000
+reg 0 77C 2000
+reg 0 77E 2000
+reg 0 780 2000
+reg 0 782 2000
+reg 0 784 2000
+reg 0 786 2000
+reg 0 000 3FFF
+reg 0 002 3FFF
+reg 0 004 1000
+reg 0 006 000F
+reg 0 1C0 0000
+reg 0 1C2 2800
+reg 0 1A0 0001
+render 24000
