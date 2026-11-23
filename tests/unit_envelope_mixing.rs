@@ -74,9 +74,11 @@ fn stereo_routing_left_only() {
 fn volume_phase_bit() {
     let mut d = Device::new();
     upload_loop(&mut d, 0x5000);
+    // 0x7FFF is -1 in 15-bit signed two's complement -> VOLXL = (-1 << 1) as u16 = 0xFFFE.
     setup_voice(&mut d, 0x000F, 0, 0x4000 | 0x3FFF, 0x3FFF);
     render(&mut d, 64);
-    assert_eq!(d.read_register(0x00C).unwrap(), 0);
+    assert_eq!(d.read_register(0x00C).unwrap(), 0xFFFE);
+    assert_eq!(d.read_register(0x00E).unwrap(), 0x7FFE);
 }
 
 #[test]

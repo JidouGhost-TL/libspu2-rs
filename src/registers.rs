@@ -217,9 +217,7 @@ pub const fn core_reg(core: usize, offset: u32) -> u32 {
 /// PS1 SPU register offsets, relative to `0x1F801C00` (`0x000..0x400`).
 ///
 /// Address registers in PS1 SPU use 8-byte units (`byte_address = value << 3`).
-/// Constants outside Play!'s Tier-1 subset (`MVOLL`/`MVOLR`, `EVOLL`/`EVOLR`,
-/// `PMON_LO`/`PMON_HI`, `NON_LO`/`NON_HI`, `TRANSFER_CTRL`) are provided for
-/// register-map completeness; writes are accepted as no-ops and reads return `0`.
+/// `TRANSFER_CTRL` is accepted as a no-op and reads back as `0`.
 pub mod ps1 {
     /// Hardware base address of the PS1 SPU register block.
     pub const REGS_BEGIN: u32 = 0x1F80_1C00;

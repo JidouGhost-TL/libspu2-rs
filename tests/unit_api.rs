@@ -11,8 +11,14 @@ use libspu2::{
 #[test]
 fn api_lifecycle_and_errors() {
     let mut d = Device::new();
-    assert_eq!(d.read_register(0x801), Err(Error::OutOfRange("register offset")));
-    assert_eq!(d.read_register(0x003), Err(Error::OutOfRange("register offset")));
+    assert_eq!(
+        d.read_register(0x801),
+        Err(Error::OutOfRange("register offset"))
+    );
+    assert_eq!(
+        d.read_register(0x003),
+        Err(Error::OutOfRange("register offset"))
+    );
     assert_eq!(
         d.write_ram(RAM_SIZE as u32, b"x"),
         Err(Error::OutOfRange("ram write"))
@@ -178,15 +184,11 @@ fn ps1_spu_mode_plays_voice_and_enforces_512k_ram() {
     };
     assert!(synth.configure_voice(&bad_vp).is_err());
     // PS1 mode also rejects Core 1 SPU2 registers (both < 0x760 and volume block).
-    assert!(spu
-        .read_register(core_reg(1, registers::VP_PITCH))
-        .is_err());
+    assert!(spu.read_register(core_reg(1, registers::VP_PITCH)).is_err());
     assert!(spu
         .write_register(core_reg(1, registers::VP_PITCH), 0x1000)
         .is_err());
-    assert!(spu
-        .read_register(core_reg(1, registers::P_MVOLL))
-        .is_err());
+    assert!(spu.read_register(core_reg(1, registers::P_MVOLL)).is_err());
     assert!(spu
         .write_register(core_reg(1, registers::P_MVOLL), 0x3FFF)
         .is_err());

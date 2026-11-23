@@ -26,8 +26,7 @@ pub fn make_sine(freq_hz: f64, count: usize) -> Vec<i16> {
 pub fn make_sine_ex(freq_hz: f64, count: usize, amplitude: f64, sample_rate: u32) -> Vec<i16> {
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
-        let phase =
-            2.0 * std::f64::consts::PI * freq_hz * (i as f64) / (sample_rate as f64);
+        let phase = 2.0 * std::f64::consts::PI * freq_hz * (i as f64) / (sample_rate as f64);
         out.push((amplitude * 32767.0 * phase.sin()) as i16);
     }
     out
@@ -148,7 +147,9 @@ pub fn run_fixture(path: &Path, device: &mut Device) -> FixtureResult {
                 let addr = u32::from_str_radix(parts.next().unwrap(), 16).unwrap();
                 let rel = parts.next().unwrap();
                 let bytes = fs::read(dir.join(rel)).expect("failed to read ram_file");
-                device.write_ram(addr, &bytes).expect("ram_file out of range");
+                device
+                    .write_ram(addr, &bytes)
+                    .expect("ram_file out of range");
             }
             "ram_hex" => {
                 let addr = u32::from_str_radix(parts.next().unwrap(), 16).unwrap();
@@ -161,7 +162,9 @@ pub fn run_fixture(path: &Path, device: &mut Device) -> FixtureResult {
                     bytes.push(u8::from_str_radix(s, 16).unwrap());
                     i += 2;
                 }
-                device.write_ram(addr, &bytes).expect("ram_hex out of range");
+                device
+                    .write_ram(addr, &bytes)
+                    .expect("ram_hex out of range");
             }
             "reg" => {
                 let core_str = parts.next().unwrap();

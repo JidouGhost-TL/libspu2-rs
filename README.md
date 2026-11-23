@@ -84,29 +84,25 @@ let mut right = [0.0f32; 128];
 spu.render_f32_planar(&mut left, &mut right).unwrap();
 ```
 
-## Upstream golden parity & scope
+## Hardware accuracy & scope
 
-**Intentional upstream parity:** `libspu2` intentionally preserves **bit-exact
-output parity** with the upstream C++ `libspu2` / Play! golden PCM fixtures.
-Synthesis quirks inherited from Play!'s `Iop_SpuBase` are deliberately kept
-intact rather than altered, so outputs remain verifiable against the upstream
-reference suite.
+`libspu2` implements PlayStation 1 SPU and PlayStation 2 SPU2 hardware synthesis
+with zero runtime dependencies and deterministic PCM output.
 
 - **Intended use:** Standalone SPU2/PS1 synthesis, PSF/PSF2/sequence playback,
   WebAssembly `AudioWorklet` players, and audio tooling. While
   `Device::receive_dma` and non-destructive `Device::irq_pending` are exposed,
   full commercial PS2 `libsd` hardware emulation (e.g. `STATX` mode echo,
-  cycle-accurate IRQ9, per-bus `P_MMIX` dry/wet muting) is outside the Play!
-  Tier-1 scope.
-- **Tier-1 Play! parity:** 2×24 ADPCM voices, linear pitch resampling, full ADSR
-  envelopes, channel volume sweeps, ADPCM looping, manual & DMA RAM transfers,
-  AutoDMA block input, IRQ watching, inter-core mixing, and hardware reverb.
-- **Known omissions (matching C++ `libspu2` / Play!):** 4-tap Gaussian
-  interpolation (linear is used), hardware noise generator, voice pitch
-  modulation (`PMON`), per-voice dry/wet `P_MMIX`/`S_VMIXL`/`S_VMIXR` gating,
-  and master/effect bus volume scaling (`P_MVOLL`/`P_EVOLL` and PS1
-  `MVOLL`/`EVOLL` are accepted without altering output gain; reverb wet return
-  uses Play!'s fixed `0.333` blend).
+  cycle-accurate IRQ9, per-bus `P_MMIX` dry/wet muting) is outside scope.
+- **Implemented hardware features:** 2×24 ADPCM voices, 512-entry 4-tap PS1/PS2
+  hardware Gaussian interpolation, signed/phase-inverted fixed voice volumes,
+  full ADSR envelopes, channel volume sweeps, ADPCM looping (including 1-block
+  `flags == 0x07` loops), voice pitch modulation (`PMON`), hardware LFSR noise
+  generator and noise clock (`NON` + `CORE_ATTR`/`SPUCNT` bits 8–13), master
+  output volume (`P_MVOLL`/`P_MVOLR` and PS1 `MVOLL`/`MVOLR`), reverb wet
+  return volume (`P_EVOLL`/`P_EVOLR` and PS1 `EVOLL`/`EVOLR`), manual & DMA RAM
+  transfers, AutoDMA block input, IRQ watching, inter-core mixing, and hardware
+  reverb.
 - **PS1 SPU mode (`Device::new_ps1`):** Runs Core 0 at 44.1 kHz over 512 KiB
   RAM with PS1 register offsets (`0x1F801C00 + offset`) and 8-byte address
   scaling; Core 1 register, DMA, voice, and rendering operations return

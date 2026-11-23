@@ -193,8 +193,10 @@ impl<'a> Synth<'a> {
             .write_register(vreg(registers::VP_VOLR), vp.right_volume)?;
         self.device
             .write_register(vreg(registers::VP_PITCH), vp.pitch)?;
-        self.device.write_register(vreg(registers::VP_ADSR1), adsr1)?;
-        self.device.write_register(vreg(registers::VP_ADSR2), adsr2)?;
+        self.device
+            .write_register(vreg(registers::VP_ADSR1), adsr1)?;
+        self.device
+            .write_register(vreg(registers::VP_ADSR2), adsr2)?;
         self.device.write_register(
             areg(registers::VA_SSA_HI),
             ((vp.start_address >> 17) & 0xFFFF) as u16,
@@ -224,8 +226,10 @@ impl<'a> Synth<'a> {
         if pitch > 0x3FFF {
             return Err(Error::InvalidArgument("pitch"));
         }
-        let reg =
-            registers::core_reg(core, registers::VP_PITCH + (voice as u32) * registers::VOICE_STRIDE);
+        let reg = registers::core_reg(
+            core,
+            registers::VP_PITCH + (voice as u32) * registers::VOICE_STRIDE,
+        );
         self.device.write_register(reg, pitch)
     }
 
@@ -244,8 +248,159 @@ impl<'a> Synth<'a> {
         let stride = (voice as u32) * registers::VOICE_STRIDE;
         self.device
             .write_register(registers::core_reg(core, registers::VP_VOLL + stride), left)?;
+        self.device.write_register(
+            registers::core_reg(core, registers::VP_VOLR + stride),
+            right,
+        )
+    }
+
+    /// Updates the signed fixed left and right volume (`-0x4000..=0x3FFF`,
+    /// where negative values invert phase) of a single voice live.
+    pub fn set_volume_signed(
+        &mut self,
+        core: usize,
+        voice: usize,
+        left: i16,
+        right: i16,
+    ) -> Result<(), Error> {
+        self.validate_core_and_voice(core, voice)?;
+        if !(-0x4000..=0x3FFF).contains(&left) || !(-0x4000..=0x3FFF).contains(&right) {
+            return Err(Error::InvalidArgument("volume"));
+        }
+        let stride = (voice as u32) * registers::VOICE_STRIDE;
+        self.device.write_register(
+            registers::core_reg(core, registers::VP_VOLL + stride),
+            (left as u16) & 0x7FFF,
+        )?;
+        self.device.write_register(
+            registers::core_reg(core, registers::VP_VOLR + stride),
+            (right as u16) & 0x7FFF,
+        )
+    }
+
+    /// Updates the ADSR envelope registers (`VP_ADSR1` / `VP_ADSR2`) of a single voice live.
+    pub fn set_adsr(&mut self, core: usize, voice: usize, adsr: AdsrConfig) -> Result<(), Error> {
+        self.validate_core_and_voice(core, voice)?;
+        if adsr.attack_rate > 0x7F
+            || adsr.decay_rate > 0x0F
+            || adsr.sustain_level > 0x0F
+            || adsr.sustain_rate > 0x7F
+            || adsr.release_rate > 0x1F
+        {
+            return Err(Error::InvalidArgument("adsr"));
+        }
+        let (adsr1, adsr2) = adsr.to_raw();
+        let stride = (voice as u32) * registers::VOICE_STRIDE;
+        self.device.write_register(
+            registers::core_reg(core, registers::VP_ADSR1 + stride),
+            adsr1,
+        )?;
+        self.device.write_register(
+            registers::core_reg(core, registers::VP_ADSR2 + stride),
+            adsr2,
+        )
+    }
+
+    /// Sets the 24-bit per-voice pitch modulation (`PMON`) enable mask on `core`.
+    ///
+    /// Bit 0 (voice 0) is ignored by hardware since there is no preceding voice.
+    pub fn set_pmon(&mut self, core: usize, voice_mask: u32) -> Result<(), Error> {
+        self.validate_core(core)?;
+        self.device.write_register(
+            registers::core_reg(core, registers::S_PMON_HI),
+            (voice_mask & 0xFFFE) as u16,
+        )?;
+        self.device.write_register(
+            registers::core_reg(core, registers::S_PMON_LO),
+            ((voice_mask >> 16) & 0x00FF) as u16,
+        )
+    }
+
+    /// Sets the 24-bit per-voice hardware noise generator (`NON`) enable mask on `core`.
+    pub fn set_noise(&mut self, core: usize, voice_mask: u32) -> Result<(), Error> {
+        self.validate_core(core)?;
+        self.device.write_register(
+            registers::core_reg(core, registers::S_NON_HI),
+            (voice_mask & 0xFFFF) as u16,
+        )?;
+        self.device.write_register(
+            registers::core_reg(core, registers::S_NON_LO),
+            ((voice_mask >> 16) & 0x00FF) as u16,
+        )
+    }
+
+    /// Sets the hardware noise clock frequency `shift` (`0..=15`) and `step` (`0..=3`)
+    /// in `CORE_ATTR` bits 8–13, preserving all other `CORE_ATTR` bits.
+    pub fn set_noise_clock(&mut self, core: usize, shift: u8, step: u8) -> Result<(), Error> {
+        self.validate_core(core)?;
+        if shift > 0x0F || step > 0x03 {
+            return Err(Error::InvalidArgument("noise clock"));
+        }
+        let reg = registers::core_reg(core, registers::CORE_ATTR);
+        let prev = self.device.read_register(reg)?;
+        let next = (prev & !0x3F00) | ((shift as u16) << 10) | ((step as u16) << 8);
+        self.device.write_register(reg, next)
+    }
+
+    /// Sets the signed fixed master output volume (`P_MVOLL` / `P_MVOLR`, `-0x4000..=0x3FFF`)
+    /// for `core`.
+    pub fn set_master_volume(&mut self, core: usize, left: i16, right: i16) -> Result<(), Error> {
+        self.validate_core(core)?;
+        if !(-0x4000..=0x3FFF).contains(&left) || !(-0x4000..=0x3FFF).contains(&right) {
+            return Err(Error::InvalidArgument("master volume"));
+        }
+        self.device.write_register(
+            registers::core_reg(core, registers::P_MVOLL),
+            (left as u16) & 0x7FFF,
+        )?;
+        self.device.write_register(
+            registers::core_reg(core, registers::P_MVOLR),
+            (right as u16) & 0x7FFF,
+        )
+    }
+
+    /// Sets the signed 16-bit reverb wet return volume (`P_EVOLL` / `P_EVOLR`, `-0x8000..=0x7FFF`)
+    /// for `core`.
+    pub fn set_reverb_volume(&mut self, core: usize, left: i16, right: i16) -> Result<(), Error> {
+        self.validate_core(core)?;
         self.device
-            .write_register(registers::core_reg(core, registers::VP_VOLR + stride), right)
+            .write_register(registers::core_reg(core, registers::P_EVOLL), left as u16)?;
+        self.device
+            .write_register(registers::core_reg(core, registers::P_EVOLR), right as u16)
+    }
+
+    /// Sets the reverb work area start (`A_ESA`) and end (`A_EEA_HI`) addresses in SPU RAM.
+    ///
+    /// `start_address` must be even and `< end_address`; `end_address` must be `<= ram_size()`
+    /// and is mapped to the hardware 128 KiB `A_EEA_HI` boundary.
+    pub fn set_reverb_work_area(
+        &mut self,
+        core: usize,
+        start_address: u32,
+        end_address: u32,
+    ) -> Result<(), Error> {
+        self.validate_core(core)?;
+        if (start_address & 1) != 0 {
+            return Err(Error::InvalidArgument("address alignment"));
+        }
+        if start_address >= end_address {
+            return Err(Error::InvalidArgument("reverb work area"));
+        }
+        if (end_address as usize) > self.device.ram_size() {
+            return Err(Error::OutOfRange("address"));
+        }
+        self.device.write_register(
+            registers::core_reg(core, registers::A_ESA_HI),
+            ((start_address >> 17) & 0xFFFF) as u16,
+        )?;
+        self.device.write_register(
+            registers::core_reg(core, registers::A_ESA_LO),
+            ((start_address >> 1) & 0xFFFF) as u16,
+        )?;
+        self.device.write_register(
+            registers::core_reg(core, registers::A_EEA_HI),
+            (((end_address - 1) >> 17) & 0x0F) as u16,
+        )
     }
 
     /// Sets the 24-bit per-voice reverb send enable mask on `core`.

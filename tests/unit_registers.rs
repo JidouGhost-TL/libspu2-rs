@@ -76,10 +76,16 @@ fn all_48_voices_key_on_and_render_nonzero_on_both_cores() {
         d.write_register(core_reg(core, registers::CORE_ATTR), 0x8000)
             .unwrap();
         for v in 0..24u32 {
-            d.write_register(core_reg(core, registers::VP_VOLL + v * VOICE_STRIDE), 0x3FFF)
-                .unwrap();
-            d.write_register(core_reg(core, registers::VP_VOLR + v * VOICE_STRIDE), 0x3FFF)
-                .unwrap();
+            d.write_register(
+                core_reg(core, registers::VP_VOLL + v * VOICE_STRIDE),
+                0x3FFF,
+            )
+            .unwrap();
+            d.write_register(
+                core_reg(core, registers::VP_VOLR + v * VOICE_STRIDE),
+                0x3FFF,
+            )
+            .unwrap();
             d.write_register(
                 core_reg(core, registers::VP_PITCH + v * VOICE_STRIDE),
                 0x1000,

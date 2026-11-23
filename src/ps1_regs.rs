@@ -42,6 +42,14 @@ pub(crate) fn read_ps1_register(base: &SpuBase, offset: u32) -> Result<u16, Erro
         return Ok(0);
     }
     Ok(match offset {
+        ps1::MVOLL => base.master_vol_l,
+        ps1::MVOLR => base.master_vol_r,
+        ps1::EVOLL => base.reverb_vol_l as u16,
+        ps1::EVOLR => base.reverb_vol_r as u16,
+        ps1::PMON_LO => (base.channel_pmon() & 0xFFFF) as u16,
+        ps1::PMON_HI => (base.channel_pmon() >> 16) as u16,
+        ps1::NON_LO => (base.channel_noise() & 0xFFFF) as u16,
+        ps1::NON_HI => (base.channel_noise() >> 16) as u16,
         ps1::EON_LO => (base.channel_reverb() & 0xFFFF) as u16,
         ps1::EON_HI => (base.channel_reverb() >> 16) as u16,
         ps1::ENDX_LO => (base.end_flags() & 0xFFFF) as u16,
@@ -121,10 +129,18 @@ pub(crate) fn write_ps1_register(
         return Ok(());
     }
     match offset {
+        ps1::MVOLL => base.master_vol_l = value,
+        ps1::MVOLR => base.master_vol_r = value,
+        ps1::EVOLL => base.set_reverb_vol_l(value as i16),
+        ps1::EVOLR => base.set_reverb_vol_r(value as i16),
         ps1::KON_LO => base.send_key_on(value as u32),
         ps1::KON_HI => base.send_key_on((value as u32) << 16),
         ps1::KOFF_LO => base.send_key_off(value as u32),
         ps1::KOFF_HI => base.send_key_off((value as u32) << 16),
+        ps1::PMON_LO => base.set_channel_pmon_lo(value),
+        ps1::PMON_HI => base.set_channel_pmon_hi(value),
+        ps1::NON_LO => base.set_channel_noise_lo(value),
+        ps1::NON_HI => base.set_channel_noise_hi(value),
         ps1::EON_LO => base.set_channel_reverb_lo(value),
         ps1::EON_HI => base.set_channel_reverb_hi(value),
         ps1::ENDX_LO | ps1::ENDX_HI => {

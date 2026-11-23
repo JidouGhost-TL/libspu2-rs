@@ -251,8 +251,6 @@ impl Device {
     /// Reads a PS1 SPU register at `offset` (even, `< 0x400`, relative to `0x1F801C00`).
     ///
     /// Operates on Core 0 using PS1 8-byte address units (`value << 3`).
-    /// Registers outside the Play! Tier-1 subset (`MVOLL`/`MVOLR`, `EVOLL`/`EVOLR`,
-    /// `PMON`, `NON`, `TRANSFER_CTRL`) return `0`.
     pub fn read_ps1_register(&self, offset: u32) -> Result<u16, Error> {
         ps1_regs::read_ps1_register(self.spu2.core(0).base(), offset)
     }
@@ -260,8 +258,6 @@ impl Device {
     /// Writes a PS1 SPU register at `offset` (even, `< 0x400`, relative to `0x1F801C00`).
     ///
     /// Operates on Core 0 using PS1 8-byte address units (`value << 3`).
-    /// Registers outside the Play! Tier-1 subset (`MVOLL`/`MVOLR`, `EVOLL`/`EVOLR`,
-    /// `PMON`, `NON`, `TRANSFER_CTRL`) are accepted as no-ops.
     pub fn write_ps1_register(&mut self, offset: u32, value: u16) -> Result<(), Error> {
         let native_rate = self.native_sample_rate();
         ps1_regs::write_ps1_register(
@@ -443,7 +439,11 @@ impl Device {
     /// Renders a single core directly into `interleaved_stereo` without inter-core mixing.
     ///
     /// Note: advances [`Device::frame_counter`] by `interleaved_stereo.len() / 2` per call.
-    pub fn render_core(&mut self, core: usize, interleaved_stereo: &mut [i16]) -> Result<(), Error> {
+    pub fn render_core(
+        &mut self,
+        core: usize,
+        interleaved_stereo: &mut [i16],
+    ) -> Result<(), Error> {
         if core >= self.core_count() {
             return Err(Error::OutOfRange("core index"));
         }

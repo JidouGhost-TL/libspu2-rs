@@ -440,7 +440,9 @@ fn round2_polish_dma_straddle_wrap_ram_bounds_adsr_raw_and_output_rate() {
     low_rate
         .write_register(registers::VP_PITCH, 0xFFFF)
         .unwrap();
-    low_rate.write_register(registers::VP_ADSR1, 0x000F).unwrap();
+    low_rate
+        .write_register(registers::VP_ADSR1, 0x000F)
+        .unwrap();
     low_rate
         .write_register(registers::VA_SSA_LO, (0x5000u32 >> 1) as u16)
         .unwrap();
@@ -454,15 +456,23 @@ fn round2_polish_dma_straddle_wrap_ram_bounds_adsr_raw_and_output_rate() {
     // 7. RAM-wrapping unaligned ADPCM block cache invalidation when writing RAM[0..15]
     let mut wrap_dev = Device::new_ps1();
     let wrap_addr = (libspu2::PS1_RAM_SIZE as u32) - 8;
-    wrap_dev.write_ram(wrap_addr, &[0x00, 0x03, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11]).unwrap();
+    wrap_dev
+        .write_ram(wrap_addr, &[0x00, 0x03, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11])
+        .unwrap();
     wrap_dev.write_ram(0, &[0x11; 8]).unwrap();
-    wrap_dev.write_ps1_register(ps1::SPUCNT, registers::CONTROL_ENABLE).unwrap();
+    wrap_dev
+        .write_ps1_register(ps1::SPUCNT, registers::CONTROL_ENABLE)
+        .unwrap();
     wrap_dev.write_ps1_register(ps1::V_VOLL, 0x3FFF).unwrap();
     wrap_dev.write_ps1_register(ps1::V_VOLR, 0x3FFF).unwrap();
     wrap_dev.write_ps1_register(ps1::V_PITCH, 0x1000).unwrap();
     wrap_dev.write_ps1_register(ps1::V_ADSR1, 0x000F).unwrap();
-    wrap_dev.write_ps1_register(ps1::V_START_ADDR, (wrap_addr >> 3) as u16).unwrap();
-    wrap_dev.write_ps1_register(ps1::V_REPEAT_ADDR, (wrap_addr >> 3) as u16).unwrap();
+    wrap_dev
+        .write_ps1_register(ps1::V_START_ADDR, (wrap_addr >> 3) as u16)
+        .unwrap();
+    wrap_dev
+        .write_ps1_register(ps1::V_REPEAT_ADDR, (wrap_addr >> 3) as u16)
+        .unwrap();
     wrap_dev.write_ps1_register(ps1::KON_LO, 1).unwrap();
     let mut before_wrap = [0i16; 64 * 2];
     wrap_dev.render_native(&mut before_wrap);

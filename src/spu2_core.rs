@@ -78,7 +78,8 @@ const fn decode_core_channel(offset: u32) -> Option<(usize, u32)> {
         let reg = offset & !(0x3F << 4);
         Some((channel_id, reg))
     } else if offset >= registers::VA_REG_BASE && offset < registers::R_REG_BASE {
-        let channel_id = ((offset - registers::VA_REG_BASE) / registers::VOICE_ADDR_STRIDE) as usize;
+        let channel_id =
+            ((offset - registers::VA_REG_BASE) / registers::VOICE_ADDR_STRIDE) as usize;
         let reg = offset - (channel_id as u32) * registers::VOICE_ADDR_STRIDE;
         Some((channel_id, reg))
     } else {
@@ -154,6 +155,12 @@ impl Spu2Core {
             }
             registers::S_ENDX_HI => (self.base.end_flags() & 0xFFFF) as u16,
             registers::S_ENDX_LO => (self.base.end_flags() >> 16) as u16,
+            registers::S_PMON_HI => (self.base.channel_pmon() & 0xFFFF) as u16,
+            registers::S_PMON_LO => (self.base.channel_pmon() >> 16) as u16,
+            registers::S_NON_HI => (self.base.channel_noise() & 0xFFFF) as u16,
+            registers::S_NON_LO => (self.base.channel_noise() >> 16) as u16,
+            registers::S_VMIXER_HI => (self.base.channel_reverb() & 0xFFFF) as u16,
+            registers::S_VMIXER_LO => (self.base.channel_reverb() >> 16) as u16,
             registers::CORE_ATTR => self.base.control(),
             registers::A_TS_MODE => self.base.transfer_mode(),
             registers::A_TSA_HI => get_address_hi(self.base.transfer_address()),
@@ -161,6 +168,10 @@ impl Spu2Core {
             registers::A_ESA_HI => get_address_hi(self.base.reverb_work_address_start()),
             registers::A_ESA_LO => get_address_lo(self.base.reverb_work_address_start()),
             registers::A_EEA_HI => get_address_hi(self.base.reverb_work_address_end()),
+            registers::P_MVOLL => self.base.master_vol_l,
+            registers::P_MVOLR => self.base.master_vol_r,
+            registers::P_EVOLL => self.base.reverb_vol_l as u16,
+            registers::P_EVOLR => self.base.reverb_vol_r as u16,
             registers::P_AVOLL => self.base.ext_input_vol_l as u16,
             registers::P_AVOLR => self.base.ext_input_vol_r as u16,
             registers::P_BVOLL => self.base.input_vol_l as u16,
@@ -207,6 +218,18 @@ impl Spu2Core {
             }
             registers::A_TS_MODE => {
                 self.base.set_transfer_mode(value);
+            }
+            registers::S_PMON_HI => {
+                self.base.set_channel_pmon_lo(value);
+            }
+            registers::S_PMON_LO => {
+                self.base.set_channel_pmon_hi(value);
+            }
+            registers::S_NON_HI => {
+                self.base.set_channel_noise_lo(value);
+            }
+            registers::S_NON_LO => {
+                self.base.set_channel_noise_hi(value);
             }
             registers::S_VMIXER_HI => {
                 self.base.set_channel_reverb_lo(value);
@@ -258,6 +281,18 @@ impl Spu2Core {
             registers::A_EEA_HI => {
                 let addr = (((value as u32) & 0x0F) << 17) | 0x1FFFF;
                 self.base.set_reverb_work_address_end(addr);
+            }
+            registers::P_MVOLL => {
+                self.base.master_vol_l = value;
+            }
+            registers::P_MVOLR => {
+                self.base.master_vol_r = value;
+            }
+            registers::P_EVOLL => {
+                self.base.set_reverb_vol_l(value as i16);
+            }
+            registers::P_EVOLR => {
+                self.base.set_reverb_vol_r(value as i16);
             }
             registers::P_AVOLL => {
                 self.base.ext_input_vol_l = value as i32;
