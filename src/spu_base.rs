@@ -967,12 +967,8 @@ impl SampleReader {
         let g1 = GAUSS_TABLE[0x1FF - gauss_idx];
         let g2 = GAUSS_TABLE[0x100 + gauss_idx];
         let g3 = GAUSS_TABLE[gauss_idx];
-        // CXD2922Q silicon: per-term arithmetic >> 15, 16-bit wrap on first 3 terms,
-        // 16-bit signed saturation on the 4th term.
-        let mut out = (((g0 * s0) >> 15) as i16)
-            .wrapping_add(((g1 * s1) >> 15) as i16)
-            .wrapping_add(((g2 * s2) >> 15) as i16) as i32;
-        out = clamp16(out + ((g3 * s3) >> 15));
+        // Hardware Gaussian interpolation: full-precision 4-tap MAC then >> 15.
+        let out = clamp16((g0 * s0 + g1 * s1 + g2 * s2 + g3 * s3) >> 15);
 
         let step = step_override.unwrap_or(self.sample_step);
         let mut next_idx = (self.src_sample_idx as u64) + (step as u64);
@@ -1073,14 +1069,14 @@ impl SampleReader {
                 let second_sample = (((sample_byte & 0xF0) as u16) << 8) as i16;
 
                 let sample0 = clamp16(
-                    ((first_sample as i32) >> shift_factor) + ((s1 * k0 + s2 * k1 + 32) >> 6),
+                    ((first_sample as i32) >> shift_factor) + ((s1 * k0) >> 6) + ((s2 * k1) >> 6),
                 );
                 s2 = s1;
                 s1 = sample0;
                 out[0] = sample0 as i16;
 
                 let sample1 = clamp16(
-                    ((second_sample as i32) >> shift_factor) + ((s1 * k0 + s2 * k1 + 32) >> 6),
+                    ((second_sample as i32) >> shift_factor) + ((s1 * k0) >> 6) + ((s2 * k1) >> 6),
                 );
                 s2 = s1;
                 s1 = sample1;
@@ -1278,7 +1274,8 @@ pub struct SpuBase {
     channel_reverb: u32,
     channel_pmon: u32,
     channel_noise: u32,
-    noise_timer: i32,
+    noise_divider: u32,
+    noise_counter: u32,
     noise_level: i16,
     reverb_work_addr_start: u32,
     reverb_work_addr_end: u32,
@@ -1289,7 +1286,7 @@ pub struct SpuBase {
     reverb_in_buf: [[i16; 64]; 2],
     reverb_in_pos: usize,
     reverb_out_buf: [[i16; 32]; 2],
-    reverb_out_pos: usize,
+    reverb_out_pos: [usize; 2],
 
     ps1_capture: bool,
     capture_offset: u32,
@@ -1332,8 +1329,9 @@ impl SpuBase {
             channel_reverb: 0,
             channel_pmon: 0,
             channel_noise: 0,
-            noise_timer: 0,
-            noise_level: 1,
+            noise_divider: 0,
+            noise_counter: 0,
+            noise_level: 0,
             reverb_work_addr_start: 0,
             reverb_work_addr_end: 0x80000,
             reverb_curr_addr: 0,
@@ -1343,7 +1341,7 @@ impl SpuBase {
             reverb_in_buf: [[0; 64]; 2],
             reverb_in_pos: 0,
             reverb_out_buf: [[0; 32]; 2],
-            reverb_out_pos: 0,
+            reverb_out_pos: [0; 2],
             ps1_capture: false,
             capture_offset: 0,
             channels: [Channel::default(); MAX_CHANNEL],
@@ -1373,8 +1371,9 @@ impl SpuBase {
         self.channel_reverb = 0;
         self.channel_pmon = 0;
         self.channel_noise = 0;
-        self.noise_timer = 0;
-        self.noise_level = 1;
+        self.noise_divider = 0;
+        self.noise_counter = 0;
+        self.noise_level = 0;
         self.reverb_ticks = 0;
         self.irq_addr = RESET_IRQ_ADDR;
         self.irq_pending = false;
@@ -1403,7 +1402,7 @@ impl SpuBase {
         self.reverb_in_buf = [[0; 64]; 2];
         self.reverb_in_pos = 0;
         self.reverb_out_buf = [[0; 32]; 2];
-        self.reverb_out_pos = 0;
+        self.reverb_out_pos = [0; 2];
         self.capture_offset = 0;
 
         for reader in &mut self.readers {
@@ -1828,8 +1827,6 @@ impl SpuBase {
                 || (CORE1_SIN_RIGHT..CORE1_SIN_RIGHT + CORE0_OUTPUT_SIZE).contains(&self.irq_addr));
 
         for frame in samples.chunks_exact_mut(2) {
-            self.step_noise();
-
             let mut out_l: i16 = 0;
             let mut out_r: i16 = 0;
             let mut reverb_sample = [0i16; 2];
@@ -1883,6 +1880,8 @@ impl SpuBase {
                     adpcm_sample
                 };
 
+                // Apply current ENVX to this frame's sample before ticking ADSR for the next frame.
+                let envx = ch.adsr_envx;
                 Self::update_adsr(ch);
                 let vol_l = Self::compute_channel_volume(ch.volume_left, ch.volume_left_abs);
                 let vol_r = Self::compute_channel_volume(ch.volume_right, ch.volume_right_abs);
@@ -1893,7 +1892,7 @@ impl SpuBase {
                     continue;
                 }
 
-                let input_sample = read_sample.wrapping_mul(ch.adsr_envx) >> 15;
+                let input_sample = read_sample.wrapping_mul(envx) >> 15;
                 voice_out[i] = clamp16(input_sample) as i16;
 
                 if input_sample == 0 {
@@ -1913,6 +1912,8 @@ impl SpuBase {
                     Self::mix_samples(input_sample, volume_right, &mut reverb_sample[1]);
                 }
             }
+
+            self.step_noise();
 
             if self.ps1_capture {
                 self.write_ps1_capture(voice_out[1], voice_out[3], ram, cache, irq_watcher);
@@ -2010,20 +2011,24 @@ impl SpuBase {
 
     #[inline]
     fn step_noise(&mut self) {
-        let noise_shift = ((self.ctrl >> 10) & 0x0F) as u32;
-        let noise_step = (((self.ctrl >> 8) & 0x03) as i32) + 4;
-        self.noise_timer -= noise_step;
-        if self.noise_timer < 0 {
-            let parity = ((self.noise_level >> 15)
-                ^ (self.noise_level >> 12)
-                ^ (self.noise_level >> 11)
-                ^ (self.noise_level >> 10)
-                ^ 1)
-                & 1;
-            self.noise_level = (self.noise_level << 1) | parity;
-            let reload = (0x20000i32 >> noise_shift).max(1);
-            while self.noise_timer < 0 {
-                self.noise_timer += reload;
+        let rf = ((self.ctrl >> 8) & 0x3F) as u32;
+        let (div_inc, cnt_inc) = if rf >= 0x3C {
+            (0x8000u32, 8u32)
+        } else {
+            let shift = rf >> 2;
+            let step = rf & 0x03;
+            (2u32 << shift, 4 + step)
+        };
+
+        self.noise_divider += div_inc;
+        if self.noise_divider >= 0x8000 {
+            self.noise_divider -= 0x8000;
+            self.noise_counter += cnt_inc;
+            if self.noise_counter >= 8 {
+                self.noise_counter -= 8;
+                let l = self.noise_level as u16;
+                let parity = ((l >> 15) ^ (l >> 12) ^ (l >> 11) ^ (l >> 10) ^ 1) & 1;
+                self.noise_level = ((l << 1) | parity) as i16;
             }
         }
     }
@@ -2069,15 +2074,7 @@ impl SpuBase {
                     ch.adsr_level.attack_exponential(),
                 )
             }
-            EnvelopePhase::Decay => {
-                let sustain_target = ((ch.adsr_level.sustain_level() + 1) * 0x800) as i32;
-                if ch.adsr_envx <= sustain_target {
-                    ch.status = EnvelopePhase::Sustain;
-                    ch.adsr_cycles = 0;
-                    return;
-                }
-                (ch.adsr_level.decay_rate(), -8, true, true)
-            }
+            EnvelopePhase::Decay => (ch.adsr_level.decay_rate(), -8, true, true),
             EnvelopePhase::Sustain => {
                 let rate = ch.adsr_rate.sustain_rate();
                 let shift = rate >> 2;
@@ -2094,25 +2091,34 @@ impl SpuBase {
             ),
         };
 
-        ch.adsr_cycles = ch.adsr_cycles.wrapping_sub(1);
-        if ch.adsr_cycles > 0 {
-            return;
-        }
-
         let mut adsr_cycles: i32 = 1i32 << shift.saturating_sub(11);
         let mut adsr_step: i32 = base_step << 11u32.saturating_sub(shift);
 
         if exponential {
             if !decreasing {
-                if ch.adsr_envx > 0x6000 {
-                    adsr_cycles = adsr_cycles.saturating_mul(4);
+                if ch.adsr_envx >= 0x6000 {
+                    if shift < 10 {
+                        adsr_step >>= 2;
+                    } else if shift == 10 {
+                        adsr_step >>= 1;
+                        adsr_cycles = adsr_cycles.saturating_mul(2);
+                    } else {
+                        adsr_cycles = adsr_cycles.saturating_mul(4);
+                    }
                 }
             } else {
                 adsr_step = (adsr_step * ch.adsr_envx) >> 15;
             }
         }
 
-        ch.adsr_cycles = adsr_cycles;
+        if ch.adsr_cycles <= 0 {
+            ch.adsr_cycles = adsr_cycles;
+        }
+        ch.adsr_cycles = ch.adsr_cycles.wrapping_sub(1);
+        if ch.adsr_cycles > 0 {
+            return;
+        }
+
         let next = (ch.adsr_envx + adsr_step).clamp(0, MAX_ADSR_LEVEL);
         ch.adsr_envx = next;
 
@@ -2125,7 +2131,7 @@ impl SpuBase {
             }
             EnvelopePhase::Decay => {
                 let sustain_target = ((ch.adsr_level.sustain_level() + 1) * 0x800) as i32;
-                if next <= sustain_target {
+                if next < sustain_target {
                     ch.status = EnvelopePhase::Sustain;
                     ch.adsr_cycles = 0;
                 }
@@ -2191,10 +2197,10 @@ impl SpuBase {
 
     /// 39-tap symmetric half-band zero-stuffed FIR upsample (22.05/24 kHz -> 44.1/48 kHz).
     #[inline]
-    fn reverb_fir_upsample(&self, ch: usize, is_odd: bool) -> i32 {
+    fn reverb_fir_upsample(&self, ch: usize, is_active: bool) -> i32 {
         let buf = &self.reverb_out_buf[ch];
-        let pos = self.reverb_out_pos;
-        if is_odd {
+        let pos = self.reverb_out_pos[ch];
+        if is_active {
             let mut acc = 0i32;
             for (j, &tap) in REVERB_FIR_ODD_TAPS.iter().enumerate() {
                 let a = buf[pos.wrapping_sub(19 - j) & 31] as i32;
@@ -2207,8 +2213,126 @@ impl SpuBase {
         }
     }
 
-    /// Hardware 16-bit saturating fixed-point reverb engine with 39-tap half-band FIR
-    /// downsample/upsample (per Nocash PSX-SPX specification).
+    #[inline]
+    const fn neg16(v: i32) -> i32 {
+        clamp16(-v)
+    }
+
+    /// Hardware IIR `(1 - IIR_ALPHA) * sample` term in Q14 (pre-`>> 1`).
+    /// Handles `IIR_ALPHA == -32768` via saturating negation so `-(-32768) -> 0x7FFF`.
+    #[inline]
+    const fn reverb_iiasm(iir_alpha: i32, sample: i32) -> i32 {
+        (sample << 1) + ((sample * Self::neg16(iir_alpha)) >> 14)
+    }
+
+    /// Runs one channel (0 = Left on odd cycles, 1 = Right on even cycles) of the
+    /// hardware 16-bit fixed-point reverb engine.
+    fn step_reverb_channel(&mut self, ch: usize, ram: &mut [u8]) -> i16 {
+        let in_s = self.reverb_fir_downsample(ch);
+
+        let v_in = self.get_reverb_coef(if ch == 0 {
+            ReverbParam::InCoefL
+        } else {
+            ReverbParam::InCoefR
+        });
+        let v_wall = self.get_reverb_coef(ReverbParam::IirCoef);
+        let v_iir = self.get_reverb_coef(ReverbParam::IirAlpha);
+
+        let (m_same, d_same, m_diff, d_diff) = if ch == 0 {
+            (
+                self.get_reverb_offset(ReverbParam::IirDestA0),
+                self.get_reverb_offset(ReverbParam::IirSrcA0),
+                self.get_reverb_offset(ReverbParam::IirDestB0),
+                self.get_reverb_offset(ReverbParam::IirSrcB1),
+            )
+        } else {
+            (
+                self.get_reverb_offset(ReverbParam::IirDestA1),
+                self.get_reverb_offset(ReverbParam::IirSrcA1),
+                self.get_reverb_offset(ReverbParam::IirDestB1),
+                self.get_reverb_offset(ReverbParam::IirSrcB0),
+            )
+        };
+
+        let in_term = (in_s * v_in) >> 14;
+
+        // Same-side reflection (IIR).
+        let iir_in_same =
+            clamp16((((self.get_reverb_sample(d_same, ram) * v_wall) >> 14) + in_term) >> 1);
+        let prev_same = self.get_reverb_sample(m_same - 2, ram);
+        let iir_same =
+            clamp16((((iir_in_same * v_iir) >> 14) + Self::reverb_iiasm(v_iir, prev_same)) >> 1);
+        self.set_reverb_sample(m_same, iir_same, ram);
+
+        // Cross-coupled different-side reflection (IIR).
+        let iir_in_diff =
+            clamp16((((self.get_reverb_sample(d_diff, ram) * v_wall) >> 14) + in_term) >> 1);
+        let prev_diff = self.get_reverb_sample(m_diff - 2, ram);
+        let iir_diff =
+            clamp16((((iir_in_diff * v_iir) >> 14) + Self::reverb_iiasm(v_iir, prev_diff)) >> 1);
+        self.set_reverb_sample(m_diff, iir_diff, ram);
+
+        // Early echo (4-tap comb filter): unclamped Q14 accumulator folded directly into APF1.
+        let v_comb1 = self.get_reverb_coef(ReverbParam::AccCoefA);
+        let v_comb2 = self.get_reverb_coef(ReverbParam::AccCoefB);
+        let v_comb3 = self.get_reverb_coef(ReverbParam::AccCoefC);
+        let v_comb4 = self.get_reverb_coef(ReverbParam::AccCoefD);
+
+        let (src_a, src_b, src_c, src_d) = if ch == 0 {
+            (
+                ReverbParam::AccSrcA0,
+                ReverbParam::AccSrcB0,
+                ReverbParam::AccSrcC0,
+                ReverbParam::AccSrcD0,
+            )
+        } else {
+            (
+                ReverbParam::AccSrcA1,
+                ReverbParam::AccSrcB1,
+                ReverbParam::AccSrcC1,
+                ReverbParam::AccSrcD1,
+            )
+        };
+
+        let comb_acc = ((v_comb1 * self.get_reverb_sample(self.get_reverb_offset(src_a), ram))
+            >> 14)
+            + ((v_comb2 * self.get_reverb_sample(self.get_reverb_offset(src_b), ram)) >> 14)
+            + ((v_comb3 * self.get_reverb_sample(self.get_reverb_offset(src_c), ram)) >> 14)
+            + ((v_comb4 * self.get_reverb_sample(self.get_reverb_offset(src_d), ram)) >> 14);
+
+        // Late reverb APF1 (cascaded into APF2).
+        let d_apf1 = self.get_reverb_offset(ReverbParam::FbSrcA);
+        let d_apf2 = self.get_reverb_offset(ReverbParam::FbSrcB);
+        let (m_apf1, m_apf2) = if ch == 0 {
+            (
+                self.get_reverb_offset(ReverbParam::MixDestA0),
+                self.get_reverb_offset(ReverbParam::MixDestB0),
+            )
+        } else {
+            (
+                self.get_reverb_offset(ReverbParam::MixDestA1),
+                self.get_reverb_offset(ReverbParam::MixDestB1),
+            )
+        };
+        let v_apf1 = self.get_reverb_coef(ReverbParam::FbAlpha);
+        let v_apf2 = self.get_reverb_coef(ReverbParam::FbX);
+
+        let fb_a = self.get_reverb_sample(m_apf1 - d_apf1, ram);
+        let mda = clamp16((comb_acc + ((fb_a * Self::neg16(v_apf1)) >> 14)) >> 1);
+        self.set_reverb_sample(m_apf1, mda, ram);
+
+        let apf1_out_q14 = (fb_a << 1) + ((mda * v_apf1) >> 14);
+
+        // Late reverb APF2.
+        let fb_b = self.get_reverb_sample(m_apf2 - d_apf2, ram);
+        let mdb = clamp16((apf1_out_q14 + ((fb_b * Self::neg16(v_apf2)) >> 14)) >> 1);
+        self.set_reverb_sample(m_apf2, mdb, ram);
+
+        clamp16(((fb_b << 1) + ((mdb * v_apf2) >> 14)) >> 1) as i16
+    }
+
+    /// Hardware 16-bit saturating fixed-point reverb engine with alternating L/R
+    /// 44.1 kHz cycles and 39-tap half-band FIR downsample/upsample.
     fn update_reverb(
         &mut self,
         reverb_sample: [i16; 2],
@@ -2223,137 +2347,13 @@ impl SpuBase {
 
         let is_odd = (self.reverb_ticks & 1) != 0;
         if is_odd {
-            let in_l = self.reverb_fir_downsample(0);
-            let in_r = self.reverb_fir_downsample(1);
-
-            let v_lin = self.get_reverb_coef(ReverbParam::InCoefL);
-            let v_rin = self.get_reverb_coef(ReverbParam::InCoefR);
-            let v_wall = self.get_reverb_coef(ReverbParam::IirCoef);
-            let v_iir = self.get_reverb_coef(ReverbParam::IirAlpha);
-
-            let lin = (in_l * v_lin) >> 15;
-            let rin = (in_r * v_rin) >> 15;
-
-            // Same-side reflection (IIR): read [m*SAME - 2], write [m*SAME].
-            let m_lsame = self.get_reverb_offset(ReverbParam::IirDestA0);
-            let m_rsame = self.get_reverb_offset(ReverbParam::IirDestA1);
-            let d_lsame = self.get_reverb_offset(ReverbParam::IirSrcA0);
-            let d_rsame = self.get_reverb_offset(ReverbParam::IirSrcA1);
-
-            let prev_lsame = self.get_reverb_sample(m_lsame - 2, ram);
-            let prev_rsame = self.get_reverb_sample(m_rsame - 2, ram);
-            let tmp_lsame =
-                clamp16(lin + ((self.get_reverb_sample(d_lsame, ram) * v_wall) >> 15) - prev_lsame);
-            let tmp_rsame =
-                clamp16(rin + ((self.get_reverb_sample(d_rsame, ram) * v_wall) >> 15) - prev_rsame);
-            let iir_lsame = clamp16(((tmp_lsame * v_iir) >> 15) + prev_lsame);
-            let iir_rsame = clamp16(((tmp_rsame * v_iir) >> 15) + prev_rsame);
-
-            // Different-side reflection (cross-coupled IIR): dRDIFF -> mLDIFF, dLDIFF -> mRDIFF.
-            let m_ldiff = self.get_reverb_offset(ReverbParam::IirDestB0);
-            let m_rdiff = self.get_reverb_offset(ReverbParam::IirDestB1);
-            let d_ldiff = self.get_reverb_offset(ReverbParam::IirSrcB0);
-            let d_rdiff = self.get_reverb_offset(ReverbParam::IirSrcB1);
-
-            let prev_ldiff = self.get_reverb_sample(m_ldiff - 2, ram);
-            let prev_rdiff = self.get_reverb_sample(m_rdiff - 2, ram);
-            let tmp_ldiff =
-                clamp16(lin + ((self.get_reverb_sample(d_rdiff, ram) * v_wall) >> 15) - prev_ldiff);
-            let tmp_rdiff =
-                clamp16(rin + ((self.get_reverb_sample(d_ldiff, ram) * v_wall) >> 15) - prev_rdiff);
-            let iir_ldiff = clamp16(((tmp_ldiff * v_iir) >> 15) + prev_ldiff);
-            let iir_rdiff = clamp16(((tmp_rdiff * v_iir) >> 15) + prev_rdiff);
-
-            self.set_reverb_sample(m_lsame, iir_lsame, ram);
-            self.set_reverb_sample(m_rsame, iir_rsame, ram);
-            self.set_reverb_sample(m_ldiff, iir_ldiff, ram);
-            self.set_reverb_sample(m_rdiff, iir_rdiff, ram);
-
-            // Early echo (4-tap comb filter).
-            let v_comb1 = self.get_reverb_coef(ReverbParam::AccCoefA);
-            let v_comb2 = self.get_reverb_coef(ReverbParam::AccCoefB);
-            let v_comb3 = self.get_reverb_coef(ReverbParam::AccCoefC);
-            let v_comb4 = self.get_reverb_coef(ReverbParam::AccCoefD);
-
-            let comb_l = clamp16(
-                ((v_comb1
-                    * self.get_reverb_sample(self.get_reverb_offset(ReverbParam::AccSrcA0), ram))
-                    >> 15)
-                    + ((v_comb2
-                        * self.get_reverb_sample(
-                            self.get_reverb_offset(ReverbParam::AccSrcB0),
-                            ram,
-                        ))
-                        >> 15)
-                    + ((v_comb3
-                        * self.get_reverb_sample(
-                            self.get_reverb_offset(ReverbParam::AccSrcC0),
-                            ram,
-                        ))
-                        >> 15)
-                    + ((v_comb4
-                        * self.get_reverb_sample(
-                            self.get_reverb_offset(ReverbParam::AccSrcD0),
-                            ram,
-                        ))
-                        >> 15),
-            );
-            let comb_r = clamp16(
-                ((v_comb1
-                    * self.get_reverb_sample(self.get_reverb_offset(ReverbParam::AccSrcA1), ram))
-                    >> 15)
-                    + ((v_comb2
-                        * self.get_reverb_sample(
-                            self.get_reverb_offset(ReverbParam::AccSrcB1),
-                            ram,
-                        ))
-                        >> 15)
-                    + ((v_comb3
-                        * self.get_reverb_sample(
-                            self.get_reverb_offset(ReverbParam::AccSrcC1),
-                            ram,
-                        ))
-                        >> 15)
-                    + ((v_comb4
-                        * self.get_reverb_sample(
-                            self.get_reverb_offset(ReverbParam::AccSrcD1),
-                            ram,
-                        ))
-                        >> 15),
-            );
-
-            // Late reverb APF1 (cascaded into APF2).
-            let d_apf1 = self.get_reverb_offset(ReverbParam::FbSrcA);
-            let d_apf2 = self.get_reverb_offset(ReverbParam::FbSrcB);
-            let m_lapf1 = self.get_reverb_offset(ReverbParam::MixDestA0);
-            let m_rapf1 = self.get_reverb_offset(ReverbParam::MixDestA1);
-            let m_lapf2 = self.get_reverb_offset(ReverbParam::MixDestB0);
-            let m_rapf2 = self.get_reverb_offset(ReverbParam::MixDestB1);
-            let v_apf1 = self.get_reverb_coef(ReverbParam::FbAlpha);
-            let v_apf2 = self.get_reverb_coef(ReverbParam::FbX);
-
-            let fb_a0 = self.get_reverb_sample(m_lapf1 - d_apf1, ram);
-            let fb_a1 = self.get_reverb_sample(m_rapf1 - d_apf1, ram);
-            let apf1_l_in = clamp16(comb_l - ((v_apf1 * fb_a0) >> 15));
-            let apf1_r_in = clamp16(comb_r - ((v_apf1 * fb_a1) >> 15));
-            self.set_reverb_sample(m_lapf1, apf1_l_in, ram);
-            self.set_reverb_sample(m_rapf1, apf1_r_in, ram);
-            let apf1_l_out = clamp16(((v_apf1 * apf1_l_in) >> 15) + fb_a0);
-            let apf1_r_out = clamp16(((v_apf1 * apf1_r_in) >> 15) + fb_a1);
-
-            // Late reverb APF2.
-            let fb_b0 = self.get_reverb_sample(m_lapf2 - d_apf2, ram);
-            let fb_b1 = self.get_reverb_sample(m_rapf2 - d_apf2, ram);
-            let apf2_l_in = clamp16(apf1_l_out - ((v_apf2 * fb_b0) >> 15));
-            let apf2_r_in = clamp16(apf1_r_out - ((v_apf2 * fb_b1) >> 15));
-            self.set_reverb_sample(m_lapf2, apf2_l_in, ram);
-            self.set_reverb_sample(m_rapf2, apf2_r_in, ram);
-            let wet_22k_l = clamp16(((v_apf2 * apf2_l_in) >> 15) + fb_b0) as i16;
-            let wet_22k_r = clamp16(((v_apf2 * apf2_r_in) >> 15) + fb_b1) as i16;
-
-            self.reverb_out_pos = (self.reverb_out_pos + 1) & 31;
-            self.reverb_out_buf[0][self.reverb_out_pos] = wet_22k_l;
-            self.reverb_out_buf[1][self.reverb_out_pos] = wet_22k_r;
+            let wet_22k_l = self.step_reverb_channel(0, ram);
+            self.reverb_out_pos[0] = (self.reverb_out_pos[0] + 1) & 31;
+            self.reverb_out_buf[0][self.reverb_out_pos[0]] = wet_22k_l;
+        } else {
+            let wet_22k_r = self.step_reverb_channel(1, ram);
+            self.reverb_out_pos[1] = (self.reverb_out_pos[1] + 1) & 31;
+            self.reverb_out_buf[1][self.reverb_out_pos[1]] = wet_22k_r;
 
             self.reverb_curr_addr = self.reverb_curr_addr.wrapping_add(2);
             if self.reverb_curr_addr >= self.reverb_work_addr_end {
@@ -2363,7 +2363,7 @@ impl SpuBase {
 
         if unmuted {
             let up_l = self.reverb_fir_upsample(0, is_odd);
-            let up_r = self.reverb_fir_upsample(1, is_odd);
+            let up_r = self.reverb_fir_upsample(1, !is_odd);
             let wet_l = (up_l * (self.reverb_vol_l as i32)) >> 15;
             let wet_r = (up_r * (self.reverb_vol_r as i32)) >> 15;
             *out_l = clamp16((*out_l as i32) + wet_l) as i16;
@@ -2456,8 +2456,7 @@ mod tests {
 
     #[test]
     fn cxd2922q_gauss_per_term_shift_wrap_and_saturate() {
-        // Verify exact CXD2922Q silicon arithmetic: per-term >> 15, i16 wrapping_add
-        // on the first 3 terms, then saturating add of the 4th term.
+        // Verify hardware-capture Gaussian MAC: full-precision 4-tap sum, >> 15, clamp16.
         let mut reader = SampleReader::new(0x80000);
         reader.set_destination_sampling_rate(44_100);
         reader.set_pitch(44_100, 0x1000);
@@ -2473,13 +2472,13 @@ mod tests {
 
         let gi = 8usize;
         let s = -32768i32;
-        let expected = {
-            let out = (((GAUSS_TABLE[0x0FF - gi] * s) >> 15) as i16)
-                .wrapping_add(((GAUSS_TABLE[0x1FF - gi] * s) >> 15) as i16)
-                .wrapping_add(((GAUSS_TABLE[0x100 + gi] * s) >> 15) as i16)
-                as i32;
-            clamp16(out + ((GAUSS_TABLE[gi] * s) >> 15))
-        };
+        let expected = clamp16(
+            (GAUSS_TABLE[0x0FF - gi] * s
+                + GAUSS_TABLE[0x1FF - gi] * s
+                + GAUSS_TABLE[0x100 + gi] * s
+                + GAUSS_TABLE[gi] * s)
+                >> 15,
+        );
         assert_eq!(got, expected);
     }
 
@@ -2497,8 +2496,8 @@ mod tests {
 
         // Feed constant DC 16000 into the upsample ring buffer.
         for _ in 0..32 {
-            base.reverb_out_pos = (base.reverb_out_pos + 1) & 31;
-            base.reverb_out_buf[0][base.reverb_out_pos] = 16_000;
+            base.reverb_out_pos[0] = (base.reverb_out_pos[0] + 1) & 31;
+            base.reverb_out_buf[0][base.reverb_out_pos[0]] = 16_000;
         }
         let up_even = base.reverb_fir_upsample(0, false);
         let up_odd = base.reverb_fir_upsample(0, true);
