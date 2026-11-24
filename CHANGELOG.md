@@ -2,7 +2,7 @@
 
 All notable changes to `libspu2` are documented in this file.
 
-## Unreleased (targeting `0.2.0`)
+## `0.2.0` — 2026-11-23
 
 ### Hardware Accuracy Upgrades (Clean-Room from Nocash PSX-SPX)
 - **4-tap Gaussian interpolation:** Replaced Play!'s 2-point linear
