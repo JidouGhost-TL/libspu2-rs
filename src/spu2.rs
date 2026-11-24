@@ -5,9 +5,10 @@
 
 //! Dual-core SPU2 register router (`Iop::CSpu2` port).
 
+use crate::adpcm::SpuSampleCache;
 use crate::registers;
 use crate::spu2_core::Spu2Core;
-use crate::spu_base::{SpuIrqWatcher, SpuSampleCache};
+use crate::spu_base::SpuIrqWatcher;
 
 const SPDIF_OUT_BYPASS: u16 = 0x0100;
 
@@ -39,7 +40,7 @@ pub(crate) const fn is_core1_register(offset: u32) -> bool {
 }
 
 /// Dual-core SPU2 register space (`0x000..0x800` relative to `0x1F900000`).
-pub struct Spu2 {
+pub(crate) struct Spu2 {
     cores: [Spu2Core; 2],
     spdif_output: u16,
     spdif_mode: u16,
@@ -47,7 +48,7 @@ pub struct Spu2 {
 }
 
 impl Spu2 {
-    pub fn new(ram_size: u32) -> Self {
+    pub(crate) fn new(ram_size: u32) -> Self {
         Self {
             cores: [Spu2Core::new(0, ram_size), Spu2Core::new(1, ram_size)],
             spdif_output: 0,
@@ -56,7 +57,7 @@ impl Spu2 {
         }
     }
 
-    pub fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.cores[0].reset();
         self.cores[1].reset();
         self.spdif_output = 0;
@@ -64,21 +65,24 @@ impl Spu2 {
         self.spdif_media = 0;
     }
 
-    pub fn core(&self, index: usize) -> &Spu2Core {
+    #[inline]
+    pub(crate) fn core(&self, index: usize) -> &Spu2Core {
         &self.cores[index]
     }
 
-    pub fn core_mut(&mut self, index: usize) -> &mut Spu2Core {
+    #[inline]
+    pub(crate) fn core_mut(&mut self, index: usize) -> &mut Spu2Core {
         &mut self.cores[index]
     }
 
-    pub fn cores_mut(&mut self) -> (&mut Spu2Core, &mut Spu2Core) {
+    #[inline]
+    pub(crate) fn cores_mut(&mut self) -> (&mut Spu2Core, &mut Spu2Core) {
         let [c0, c1] = &mut self.cores;
         (c0, c1)
     }
 
     /// Returns the pending per-core IRQ bitmask (`C_IRQINFO` layout) without clearing it.
-    pub fn irq_pending(&self) -> u16 {
+    pub(crate) fn irq_pending(&self) -> u16 {
         let mut result = 0u16;
         for (i, core) in self.cores.iter().enumerate() {
             if core.base().irq_pending() {
@@ -91,7 +95,7 @@ impl Spu2 {
     /// Reads an SPU2 register at `offset` (`0x000..0x800`).
     ///
     /// Reading `C_IRQINFO` reports and clears pending per-core IRQ flags.
-    pub fn read_register(&mut self, offset: u32) -> u16 {
+    pub(crate) fn read_register(&mut self, offset: u32) -> u16 {
         match decode_register_offset(offset) {
             RegisterTarget::Core(core_id, local) => self.cores[core_id].read_register(local),
             RegisterTarget::Global(off) => self.read_global(off),
@@ -99,7 +103,7 @@ impl Spu2 {
     }
 
     /// Writes an SPU2 register at `offset` (`0x000..0x800`).
-    pub fn write_register(
+    pub(crate) fn write_register(
         &mut self,
         offset: u32,
         value: u16,

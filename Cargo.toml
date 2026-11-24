@@ -8,6 +8,10 @@ readme = "README.md"
 repository = "https://github.com/JidouGhost-TL/libspu2-rs"
 description = "Standalone pure-Rust PlayStation 2 SPU2 (and PS1 SPU) audio synthesis library"
 keywords = ["ps2", "spu2", "ps1", "adpcm", "audio"]
-categories = ["multimedia::audio", "emulators"]
+categories = ["multimedia::audio", "emulators", "no-std"]
+
+[features]
+default = ["std"]
+std = []
 
 [dependencies]

@@ -5,13 +5,10 @@
 
 //! Per-core SPU2 register dispatch (`Iop::Spu2::CCore` port).
 
+use crate::adpcm::SpuSampleCache;
 use crate::registers;
-use crate::spu_base::{
-    AdsrLevel, AdsrRate, ReverbParam, SpuBase, SpuIrqWatcher, SpuSampleCache, CONTROL_DMA,
-    MAX_CHANNEL,
-};
-
-pub const DEFAULT_BASE_SAMPLING_RATE: u32 = 48_000;
+use crate::reverb::ReverbParam;
+use crate::spu_base::{SpuBase, SpuIrqWatcher, CONTROL_DMA, MAX_CHANNEL};
 
 const ADDRESS_REGISTER_MAPPING: [ReverbParam; 22] = [
     ReverbParam::FbSrcA,
@@ -88,39 +85,33 @@ const fn decode_core_channel(offset: u32) -> Option<(usize, u32)> {
 }
 
 /// Register-level wrapper around one [`SpuBase`] core.
-pub struct Spu2Core {
-    base_sampling_rate: u32,
+pub(crate) struct Spu2Core {
     base: SpuBase,
 }
 
 impl Spu2Core {
-    pub fn new(core_id: usize, ram_size: u32) -> Self {
+    pub(crate) fn new(core_id: usize, ram_size: u32) -> Self {
         Self {
-            base_sampling_rate: DEFAULT_BASE_SAMPLING_RATE,
             base: SpuBase::new(core_id, ram_size),
         }
     }
 
-    pub fn reset(&mut self) {
-        self.base_sampling_rate = DEFAULT_BASE_SAMPLING_RATE;
+    pub(crate) fn reset(&mut self) {
         self.base.reset();
     }
 
-    pub fn set_base_sampling_rate(&mut self, rate: u32) {
-        self.base_sampling_rate = rate;
-        self.base.set_base_sampling_rate(rate);
-    }
-
-    pub fn base(&self) -> &SpuBase {
+    #[inline]
+    pub(crate) fn base(&self) -> &SpuBase {
         &self.base
     }
 
-    pub fn base_mut(&mut self) -> &mut SpuBase {
+    #[inline]
+    pub(crate) fn base_mut(&mut self) -> &mut SpuBase {
         &mut self.base
     }
 
     /// Reads a core-0-normalized register offset (`0x000..0x7FF`).
-    pub fn read_register(&self, offset: u32) -> u16 {
+    pub(crate) fn read_register(&self, offset: u32) -> u16 {
         if let Some((channel_id, reg)) = decode_core_channel(offset) {
             self.read_register_channel(channel_id, reg)
         } else {
@@ -129,7 +120,7 @@ impl Spu2Core {
     }
 
     /// Writes a core-0-normalized register offset (`0x000..0x7FF`).
-    pub fn write_register(
+    pub(crate) fn write_register(
         &mut self,
         offset: u32,
         value: u16,
@@ -159,8 +150,10 @@ impl Spu2Core {
             registers::S_PMON_LO => (self.base.channel_pmon() >> 16) as u16,
             registers::S_NON_HI => (self.base.channel_noise() & 0xFFFF) as u16,
             registers::S_NON_LO => (self.base.channel_noise() >> 16) as u16,
-            registers::S_VMIXER_HI => (self.base.channel_reverb() & 0xFFFF) as u16,
-            registers::S_VMIXER_LO => (self.base.channel_reverb() >> 16) as u16,
+            registers::S_VMIXEL_HI => (self.base.channel_reverb_l() & 0xFFFF) as u16,
+            registers::S_VMIXEL_LO => (self.base.channel_reverb_l() >> 16) as u16,
+            registers::S_VMIXER_HI => (self.base.channel_reverb_r() & 0xFFFF) as u16,
+            registers::S_VMIXER_LO => (self.base.channel_reverb_r() >> 16) as u16,
             registers::CORE_ATTR => self.base.control(),
             registers::A_TS_MODE => self.base.transfer_mode(),
             registers::A_TSA_HI => get_address_hi(self.base.transfer_address()),
@@ -212,7 +205,6 @@ impl Spu2Core {
 
         match offset {
             registers::CORE_ATTR => {
-                self.base.set_base_sampling_rate(self.base_sampling_rate);
                 self.base.set_control(value, irq_watcher);
             }
             registers::A_STD => {
@@ -233,11 +225,17 @@ impl Spu2Core {
             registers::S_NON_LO => {
                 self.base.set_channel_noise_hi(value);
             }
+            registers::S_VMIXEL_HI => {
+                self.base.set_channel_reverb_l_lo(value);
+            }
+            registers::S_VMIXEL_LO => {
+                self.base.set_channel_reverb_l_hi(value);
+            }
             registers::S_VMIXER_HI => {
-                self.base.set_channel_reverb_lo(value);
+                self.base.set_channel_reverb_r_lo(value);
             }
             registers::S_VMIXER_LO => {
-                self.base.set_channel_reverb_hi(value);
+                self.base.set_channel_reverb_r_hi(value);
             }
             registers::A_KON_HI => {
                 self.base.send_key_on(value as u32);
@@ -341,21 +339,12 @@ impl Spu2Core {
             return;
         }
         match reg {
-            registers::VP_VOLL => self.base.channel_mut(channel_id).set_volume_left(value),
-            registers::VP_VOLR => self.base.channel_mut(channel_id).set_volume_right(value),
-            registers::VP_PITCH => {
-                self.base.channel_mut(channel_id).pitch = value;
-                self.base.on_channel_pitch_changed(channel_id);
-            }
-            registers::VP_ADSR1 => {
-                self.base.channel_mut(channel_id).adsr_level = AdsrLevel(value);
-            }
-            registers::VP_ADSR2 => {
-                self.base.channel_mut(channel_id).adsr_rate = AdsrRate(value);
-            }
-            registers::VP_ENVX => {
-                self.base.channel_mut(channel_id).adsr_envx = (value as i16) as i32;
-            }
+            registers::VP_VOLL => self.base.set_voice_volume_left(channel_id, value),
+            registers::VP_VOLR => self.base.set_voice_volume_right(channel_id, value),
+            registers::VP_PITCH => self.base.set_voice_pitch(channel_id, value),
+            registers::VP_ADSR1 => self.base.set_voice_adsr1(channel_id, value),
+            registers::VP_ADSR2 => self.base.set_voice_adsr2(channel_id, value),
+            registers::VP_ENVX => self.base.set_voice_envx(channel_id, value),
             registers::VA_SSA_HI => {
                 let ch = self.base.channel_mut(channel_id);
                 ch.address = set_address_hi(ch.address, value);

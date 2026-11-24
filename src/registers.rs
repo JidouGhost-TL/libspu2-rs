@@ -50,16 +50,24 @@ pub const S_VMIXL_HI: u32 = 0x188;
 /// Voice dry left mix enable mask, voices 16–23 (`S_VMIXL_LO`).
 pub const S_VMIXL_LO: u32 = 0x18A;
 /// Voice wet (reverb) left mix enable mask, voices 0–15 (`S_VMIXEL_HI`).
+///
+/// Combined via bitwise OR with [`S_VMIXER_HI`] for per-voice stereo reverb send.
 pub const S_VMIXEL_HI: u32 = 0x18C;
 /// Voice wet (reverb) left mix enable mask, voices 16–23 (`S_VMIXEL_LO`).
+///
+/// Combined via bitwise OR with [`S_VMIXER_LO`] for per-voice stereo reverb send.
 pub const S_VMIXEL_LO: u32 = 0x18E;
 /// Voice dry right mix enable mask, voices 0–15 (`S_VMIXR_HI`).
 pub const S_VMIXR_HI: u32 = 0x190;
 /// Voice dry right mix enable mask, voices 16–23 (`S_VMIXR_LO`).
 pub const S_VMIXR_LO: u32 = 0x192;
 /// Voice wet (reverb) right mix enable mask, voices 0–15 (`S_VMIXER_HI`).
+///
+/// Combined via bitwise OR with [`S_VMIXEL_HI`] for per-voice stereo reverb send.
 pub const S_VMIXER_HI: u32 = 0x194;
 /// Voice wet (reverb) right mix enable mask, voices 16–23 (`S_VMIXER_LO`).
+///
+/// Combined via bitwise OR with [`S_VMIXEL_LO`] for per-voice stereo reverb send.
 pub const S_VMIXER_LO: u32 = 0x196;
 /// Core dry/wet bus mix switches (`P_MMIX`).
 pub const P_MMIX: u32 = 0x198;

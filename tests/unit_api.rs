@@ -344,12 +344,26 @@ fn synth_live_controls_and_dma_and_non_destructive_irq_peek() {
     {
         let mut s = Synth::new(&mut d);
         s.enable_core(0, true).unwrap();
+        s.enable_reverb(0, true).unwrap();
+        assert_ne!(
+            s.device_mut().read_register(registers::CORE_ATTR).unwrap() & registers::CONTROL_REVERB,
+            0
+        );
+        s.enable_reverb(0, false).unwrap();
+        assert_eq!(
+            s.device_mut().read_register(registers::CORE_ATTR).unwrap() & registers::CONTROL_REVERB,
+            0
+        );
         s.set_pitch(0, 2, 0x2000).unwrap();
         s.set_volume(0, 2, 0x1234, 0x2345).unwrap();
         s.set_reverb_send(0, 0x0000_0004).unwrap();
         s.key_on_voice(0, 2).unwrap();
         s.key_off_voice(0, 2).unwrap();
     }
+    assert_eq!(d.read_register(registers::S_VMIXEL_HI).unwrap(), 0x0004);
+    assert_eq!(d.read_register(registers::S_VMIXER_HI).unwrap(), 0x0004);
+    assert_eq!(d.ram().len(), d.ram_size());
+    assert_eq!(&d.ram()[0x5000..0x5020], &payload);
     assert_eq!(d.inspect_voice(0, 2).unwrap().pitch, 0x2000);
 
     // Non-destructive irq_pending vs C_IRQINFO clear

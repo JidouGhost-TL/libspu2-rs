@@ -2,11 +2,11 @@
 
 //! PlayStation 1 SPU register dispatch (`0x1F801C00 + offset`, `0x000..0x400`).
 
+use crate::adpcm::SpuSampleCache;
 use crate::device::Error;
 use crate::registers::ps1;
-use crate::spu_base::{
-    AdsrLevel, AdsrRate, ReverbParam, SpuBase, SpuIrqWatcher, SpuSampleCache, CONTROL_DMA,
-};
+use crate::reverb::ReverbParam;
+use crate::spu_base::{SpuBase, SpuIrqWatcher, CONTROL_DMA};
 
 /// Reads a PS1 SPU register from Core 0 (`offset` even, `< 0x400`).
 pub(crate) fn read_ps1_register(base: &SpuBase, offset: u32) -> Result<u16, Error> {
@@ -78,7 +78,6 @@ pub(crate) fn read_ps1_register(base: &SpuBase, offset: u32) -> Result<u16, Erro
 /// Writes a PS1 SPU register to Core 0 (`offset` even, `< 0x400`).
 pub(crate) fn write_ps1_register(
     base: &mut SpuBase,
-    native_rate: u32,
     offset: u32,
     value: u16,
     ram: &mut [u8],
@@ -92,24 +91,15 @@ pub(crate) fn write_ps1_register(
         let voice = (offset / ps1::VOICE_STRIDE) as usize;
         let reg = offset % ps1::VOICE_STRIDE;
         match reg {
-            ps1::V_VOLL => base.channel_mut(voice).set_volume_left(value),
-            ps1::V_VOLR => base.channel_mut(voice).set_volume_right(value),
-            ps1::V_PITCH => {
-                base.channel_mut(voice).pitch = value;
-                base.on_channel_pitch_changed(voice);
-            }
+            ps1::V_VOLL => base.set_voice_volume_left(voice, value),
+            ps1::V_VOLR => base.set_voice_volume_right(voice, value),
+            ps1::V_PITCH => base.set_voice_pitch(voice, value),
             ps1::V_START_ADDR => {
                 base.channel_mut(voice).address = (value as u32) << 3;
             }
-            ps1::V_ADSR1 => {
-                base.channel_mut(voice).adsr_level = AdsrLevel(value);
-            }
-            ps1::V_ADSR2 => {
-                base.channel_mut(voice).adsr_rate = AdsrRate(value);
-            }
-            ps1::V_ENVX => {
-                base.channel_mut(voice).adsr_envx = (value as i16) as i32;
-            }
+            ps1::V_ADSR1 => base.set_voice_adsr1(voice, value),
+            ps1::V_ADSR2 => base.set_voice_adsr2(voice, value),
+            ps1::V_ENVX => base.set_voice_envx(voice, value),
             ps1::V_REPEAT_ADDR => {
                 let ch = base.channel_mut(voice);
                 ch.repeat = (value as u32) << 3;
@@ -144,8 +134,8 @@ pub(crate) fn write_ps1_register(
         ps1::PMON_HI => base.set_channel_pmon_hi(value),
         ps1::NON_LO => base.set_channel_noise_lo(value),
         ps1::NON_HI => base.set_channel_noise_hi(value),
-        ps1::EON_LO => base.set_channel_reverb_lo(value),
-        ps1::EON_HI => base.set_channel_reverb_hi(value),
+        ps1::EON_LO => base.set_channel_reverb_both_lo(value),
+        ps1::EON_HI => base.set_channel_reverb_both_hi(value),
         // PS1 ENDX is read-only; bits are cleared per-voice on KON.
         ps1::ENDX_LO | ps1::ENDX_HI => {}
         ps1::RVB_WORK_ADDR => base.set_reverb_work_address_start((value as u32) << 3),
@@ -155,7 +145,6 @@ pub(crate) fn write_ps1_register(
             base.write_word(value, ram, cache);
         }
         ps1::SPUCNT => {
-            base.set_base_sampling_rate(native_rate);
             base.set_control(value, irq_watcher);
         }
         _ => {}

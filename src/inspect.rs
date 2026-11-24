@@ -22,13 +22,14 @@ pub enum EnvelopePhase {
 }
 
 /// Snapshot of a single voice's internal state as of the last rendered frame
-/// (plus immediate write side effects such as the key-on `ENVX` pre-load).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// (plus immediate register write side effects such as key-on/key-off and
+/// fixed-volume updates).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct VoiceState {
     /// Raw 16-bit pitch register value (`0x1000` = unity).
     pub pitch: u16,
-    /// Envelope level (`0..=0x7FFF`; top 16 bits of internal 32-bit ADSR volume).
+    /// Current 15-bit ADSR envelope level (`0..=0x7FFF`).
     pub envx: u16,
     /// Current ADSR envelope phase.
     pub envelope_phase: EnvelopePhase,
@@ -40,8 +41,10 @@ pub struct VoiceState {
     pub current_address: u32,
     /// Voice loop/repeat address in SPU RAM (bytes).
     pub repeat_address: u32,
-    /// Current internal 32-bit left channel volume level (`fixed_volume << 17`, max `0x7FFE_0000`).
+    /// Current internal signed 32-bit left channel volume level
+    /// (`-0x8000_0000..=0x7FFF_FFFF`; fixed volume is `vol << 17`, range `-0x8000_0000..=0x7FFE_0000`).
     pub volume_left: i32,
-    /// Current internal 32-bit right channel volume level (`fixed_volume << 17`, max `0x7FFE_0000`).
+    /// Current internal signed 32-bit right channel volume level
+    /// (`-0x8000_0000..=0x7FFF_FFFF`; fixed volume is `vol << 17`, range `-0x8000_0000..=0x7FFE_0000`).
     pub volume_right: i32,
 }

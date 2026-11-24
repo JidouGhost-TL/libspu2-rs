@@ -296,12 +296,22 @@ fn synth_error_branches_and_error_display() {
     let mut d = Device::new();
     let mut s = Synth::new(&mut d);
 
-    // Invalid volume
+    // Invalid volume (above +0x3FFF and below -0x4000)
     let mut vp = VoiceParameters {
         left_volume: 0x4000,
         ..VoiceParameters::default()
     };
     assert!(s.configure_voice(&vp).is_err());
+    vp.left_volume = -0x4001;
+    assert!(s.configure_voice(&vp).is_err());
+    // Valid negative (phase-inverted) volume
+    vp.left_volume = -0x4000;
+    vp.right_volume = -0x2000;
+    assert!(s.configure_voice(&vp).is_ok());
+    assert_eq!(
+        s.device().inspect_voice(0, 0).unwrap().volume_left,
+        i32::MIN
+    );
 
     // Invalid pitch
     vp.left_volume = 0x3FFF;

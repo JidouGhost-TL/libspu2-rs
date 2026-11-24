@@ -6,7 +6,7 @@ use crate::device::{Device, Error, StereoI16, VOICES_PER_CORE};
 use crate::registers;
 
 /// ADSR envelope parameters for [`VoiceParameters`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AdsrConfig {
     /// Attack rate (`0..=0x7F`; `0` = fastest).
     pub attack_rate: u8,
@@ -78,7 +78,7 @@ impl AdsrConfig {
 }
 
 /// High-level voice configuration translated to standard SPU2 register writes by [`Synth`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VoiceParameters {
     /// Target core (`0` or `1`; only `0` in [`crate::DeviceMode::Ps1Spu`]).
     pub core: usize,
@@ -90,10 +90,10 @@ pub struct VoiceParameters {
     pub loop_address: Option<u32>,
     /// Playback pitch (`0..=0x3FFF`; `0x1000` = unity).
     pub pitch: u16,
-    /// Fixed left volume (`0..=0x3FFF`).
-    pub left_volume: u16,
-    /// Fixed right volume (`0..=0x3FFF`).
-    pub right_volume: u16,
+    /// Signed fixed left volume (`-0x4000..=0x3FFF`; negative values invert phase).
+    pub left_volume: i16,
+    /// Signed fixed right volume (`-0x4000..=0x3FFF`; negative values invert phase).
+    pub right_volume: i16,
     /// ADSR envelope configuration.
     pub adsr: AdsrConfig,
 }
@@ -126,6 +126,7 @@ pub struct Synth<'a> {
 
 impl<'a> Synth<'a> {
     /// Wraps a mutable reference to `device`.
+    #[must_use]
     pub fn new(device: &'a mut Device) -> Self {
         Self { device }
     }
@@ -156,6 +157,20 @@ impl<'a> Synth<'a> {
         self.device.write_register(reg, next)
     }
 
+    /// Enables or disables reverb master write on `core` via `CORE_ATTR` bit 7
+    /// (`CONTROL_REVERB`), preserving all other `CORE_ATTR` bits.
+    pub fn enable_reverb(&mut self, core: usize, enabled: bool) -> Result<(), Error> {
+        self.validate_core(core)?;
+        let reg = registers::core_reg(core, registers::CORE_ATTR);
+        let prev = self.device.read_register(reg)?;
+        let next = if enabled {
+            prev | registers::CONTROL_REVERB
+        } else {
+            prev & !registers::CONTROL_REVERB
+        };
+        self.device.write_register(reg, next)
+    }
+
     /// Validates and writes all voice registers for `vp`.
     ///
     /// When `vp.loop_address` is `None`, any prior explicit loop override on
@@ -166,7 +181,9 @@ impl<'a> Synth<'a> {
         if let Some(loop_addr) = vp.loop_address {
             self.validate_address(loop_addr)?;
         }
-        if vp.left_volume > 0x3FFF || vp.right_volume > 0x3FFF {
+        if !(-0x4000..=0x3FFF).contains(&vp.left_volume)
+            || !(-0x4000..=0x3FFF).contains(&vp.right_volume)
+        {
             return Err(Error::InvalidArgument("volume"));
         }
         if vp.pitch > 0x3FFF {
@@ -189,9 +206,9 @@ impl<'a> Synth<'a> {
             |reg: u32| registers::core_reg(vp.core, reg + idx * registers::VOICE_ADDR_STRIDE);
 
         self.device
-            .write_register(vreg(registers::VP_VOLL), vp.left_volume)?;
+            .write_register(vreg(registers::VP_VOLL), (vp.left_volume as u16) & 0x7FFF)?;
         self.device
-            .write_register(vreg(registers::VP_VOLR), vp.right_volume)?;
+            .write_register(vreg(registers::VP_VOLR), (vp.right_volume as u16) & 0x7FFF)?;
         self.device
             .write_register(vreg(registers::VP_PITCH), vp.pitch)?;
         self.device
@@ -404,17 +421,20 @@ impl<'a> Synth<'a> {
         )
     }
 
-    /// Sets the 24-bit per-voice reverb send enable mask on `core`.
+    /// Sets the 24-bit per-voice reverb send enable mask on `core` (writes both
+    /// `S_VMIXEL` and `S_VMIXER`).
     pub fn set_reverb_send(&mut self, core: usize, voice_mask: u32) -> Result<(), Error> {
         self.validate_core(core)?;
-        self.device.write_register(
-            registers::core_reg(core, registers::S_VMIXER_HI),
-            (voice_mask & 0xFFFF) as u16,
-        )?;
-        self.device.write_register(
-            registers::core_reg(core, registers::S_VMIXER_LO),
-            ((voice_mask >> 16) & 0x00FF) as u16,
-        )
+        let lo = (voice_mask & 0xFFFF) as u16;
+        let hi = ((voice_mask >> 16) & 0x00FF) as u16;
+        self.device
+            .write_register(registers::core_reg(core, registers::S_VMIXEL_HI), lo)?;
+        self.device
+            .write_register(registers::core_reg(core, registers::S_VMIXEL_LO), hi)?;
+        self.device
+            .write_register(registers::core_reg(core, registers::S_VMIXER_HI), lo)?;
+        self.device
+            .write_register(registers::core_reg(core, registers::S_VMIXER_LO), hi)
     }
 
     /// Triggers key-on for the voices in `voice_mask` on `core`.

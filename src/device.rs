@@ -2,10 +2,15 @@
 
 //! High-level SPU2 / PS1 SPU device facade.
 
+use alloc::vec;
+use alloc::vec::Vec;
+use core::fmt;
+
+use crate::adpcm::SpuSampleCache;
 use crate::inspect::VoiceState;
 use crate::ps1_regs;
 use crate::spu2::{self, Spu2};
-use crate::spu_base::{SpuBase, SpuIrqWatcher, SpuSampleCache, MAX_CHANNEL};
+use crate::spu_base::{SpuBase, SpuIrqWatcher, MAX_CHANNEL};
 
 /// Number of SPU2 cores (`2`).
 pub const CORE_COUNT: usize = 2;
@@ -26,7 +31,7 @@ pub const PS1_SAMPLE_RATE: u32 = 44_100;
 const CHUNK_FRAMES: usize = 256;
 
 /// Hardware operating mode of a [`Device`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum DeviceMode {
     /// PlayStation 2 SPU2: 2 cores (48 voices), 2 MiB RAM, 48 kHz native clock.
@@ -36,7 +41,7 @@ pub enum DeviceMode {
 }
 
 /// Errors returned by [`Device`] and [`crate::Synth`] operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Error {
     /// An argument violated a structural constraint (e.g. alignment, length, or parameter range).
@@ -45,8 +50,8 @@ pub enum Error {
     OutOfRange(&'static str),
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
             Self::OutOfRange(msg) => write!(f, "out of range: {msg}"),
@@ -54,10 +59,11 @@ impl std::fmt::Display for Error {
     }
 }
 
+#[cfg(feature = "std")]
 impl std::error::Error for Error {}
 
 /// Interleaved stereo 16-bit PCM frame.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(C)]
 pub struct StereoI16 {
     /// Left channel sample.
@@ -78,8 +84,8 @@ pub struct Device {
     core1_buffer: [i16; CHUNK_FRAMES * 2],
 }
 
-impl std::fmt::Debug for Device {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for Device {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Device")
             .field("mode", &self.mode)
             .field("ram_size", &self.ram.len())
@@ -97,11 +103,13 @@ impl Default for Device {
 
 impl Device {
     /// Creates a new PlayStation 2 SPU2 device (2 cores, 2 MiB RAM, 48 kHz).
+    #[must_use]
     pub fn new() -> Self {
         Self::with_mode(DeviceMode::Spu2)
     }
 
     /// Creates a new device in PS1 SPU compatibility mode (Core 0, 512 KiB RAM, 44.1 kHz).
+    #[must_use]
     pub fn new_ps1() -> Self {
         Self::with_mode(DeviceMode::Ps1Spu)
     }
@@ -153,6 +161,12 @@ impl Device {
         self.ram.len()
     }
 
+    /// Returns a read-only slice of the full SPU RAM buffer.
+    #[must_use]
+    pub fn ram(&self) -> &[u8] {
+        &self.ram
+    }
+
     /// Returns the current output sample rate in Hz (defaults to `48000` for
     /// SPU2 or `44100` for PS1 SPU; adjustable via [`Device::set_output_sample_rate`]).
     #[must_use]
@@ -201,8 +215,14 @@ impl Device {
 
         let rate = self.native_sample_rate();
         self.output_sample_rate = rate;
-        self.spu2.core_mut(0).set_base_sampling_rate(rate);
-        self.spu2.core_mut(1).set_base_sampling_rate(rate);
+        self.spu2
+            .core_mut(0)
+            .base_mut()
+            .set_base_sampling_rate(rate);
+        self.spu2
+            .core_mut(1)
+            .base_mut()
+            .set_base_sampling_rate(rate);
         self.spu2
             .core_mut(0)
             .base_mut()
@@ -263,10 +283,8 @@ impl Device {
     ///
     /// Operates on Core 0 using PS1 8-byte address units (`value << 3`).
     pub fn write_ps1_register(&mut self, offset: u32, value: u16) -> Result<(), Error> {
-        let native_rate = self.native_sample_rate();
         ps1_regs::write_ps1_register(
             self.spu2.core_mut(0).base_mut(),
-            native_rate,
             offset,
             value,
             &mut self.ram,

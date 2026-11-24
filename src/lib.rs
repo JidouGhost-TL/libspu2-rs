@@ -1,13 +1,22 @@
 // SPDX-License-Identifier: BSD-2-Clause
 
 #![doc = include_str!("../README.md")]
+#![no_std]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std;
+
+mod adpcm;
 mod device;
+mod envelope;
 mod inspect;
+mod noise;
 mod ps1_regs;
 pub mod registers;
+mod reverb;
 mod spu2;
 mod spu2_core;
 mod spu_base;
