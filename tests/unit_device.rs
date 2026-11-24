@@ -10,7 +10,7 @@ fn write_loud_block(d: &mut Device, addr: u32) {
 }
 
 fn setup_voice0(d: &mut Device, sample_addr: u32) {
-    d.write_register(0x19A, 0x8000).unwrap(); // CORE_ATTR
+    d.write_register(0x19A, 0xC000).unwrap(); // CORE_ATTR (enable + unmute)
     d.write_register(0x000, 0x3FFF).unwrap(); // VP_VOLL
     d.write_register(0x002, 0x3FFF).unwrap(); // VP_VOLR
     d.write_register(0x004, 0x1000).unwrap(); // VP_PITCH

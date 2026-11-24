@@ -66,7 +66,7 @@ fn adpcm_plays_on_device() {
     let pcm = common::make_sine(440.0, 28 * 32);
     let enc = common::encode_adpcm(&pcm, true, 0);
     d.write_ram(0x5000, &enc).unwrap();
-    d.write_register(0x19A, 0x8000).unwrap();
+    d.write_register(0x19A, 0xC000).unwrap();
     d.write_register(0x000, 0x3FFF).unwrap();
     d.write_register(0x002, 0x3FFF).unwrap();
     d.write_register(0x004, 0x1000).unwrap();

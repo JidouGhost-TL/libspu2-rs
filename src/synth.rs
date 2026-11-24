@@ -142,13 +142,14 @@ impl<'a> Synth<'a> {
     }
 
     /// Enables or disables `core` via `CORE_ATTR` bit 15 (`CONTROL_ENABLE`),
-    /// preserving all other `CORE_ATTR` bits.
+    /// also setting bit 14 (`CONTROL_UNMUTE`) when enabling, while preserving
+    /// all other `CORE_ATTR` bits.
     pub fn enable_core(&mut self, core: usize, enabled: bool) -> Result<(), Error> {
         self.validate_core(core)?;
         let reg = registers::core_reg(core, registers::CORE_ATTR);
         let prev = self.device.read_register(reg)?;
         let next = if enabled {
-            prev | registers::CONTROL_ENABLE
+            prev | registers::CONTROL_ENABLE | registers::CONTROL_UNMUTE
         } else {
             prev & !registers::CONTROL_ENABLE
         };

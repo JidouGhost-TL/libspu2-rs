@@ -63,7 +63,7 @@ fn convenience_voice_encodes_and_plays() {
     let pcm = common::make_sine(440.0, 28 * 32);
     let enc = common::encode_adpcm(&pcm, true, 0);
     device.write_ram(0x5000, &enc).unwrap();
-    device.write_register(registers::CORE_ATTR, 0x8000).unwrap();
+    device.write_register(registers::CORE_ATTR, 0xC000).unwrap();
 
     let vp = VoiceParameters {
         core: 0,
@@ -146,7 +146,7 @@ fn ps1_spu_mode_plays_voice_and_enforces_512k_ram() {
     let enc = common::encode_adpcm(&pcm, true, 0);
     spu.write_ram(0x1000, &enc).unwrap();
 
-    spu.write_ps1_register(ps1::SPUCNT, 0x8000).unwrap();
+    spu.write_ps1_register(ps1::SPUCNT, 0xC000).unwrap();
     spu.write_ps1_register(ps1::V_VOLL, 0x3FFF).unwrap();
     spu.write_ps1_register(ps1::V_VOLR, 0x3FFF).unwrap();
     spu.write_ps1_register(ps1::V_PITCH, 0x1000).unwrap();

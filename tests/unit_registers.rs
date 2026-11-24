@@ -73,7 +73,7 @@ fn all_48_voices_key_on_and_render_nonzero_on_both_cores() {
     d.write_ram(0x5000, &block).unwrap();
 
     for core in 0..2usize {
-        d.write_register(core_reg(core, registers::CORE_ATTR), 0x8000)
+        d.write_register(core_reg(core, registers::CORE_ATTR), 0xC000)
             .unwrap();
         for v in 0..24u32 {
             d.write_register(

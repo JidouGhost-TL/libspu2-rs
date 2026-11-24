@@ -211,6 +211,10 @@ impl Device {
             .core_mut(1)
             .base_mut()
             .set_destination_sampling_rate(rate);
+        self.spu2
+            .core_mut(0)
+            .base_mut()
+            .set_ps1_capture(self.mode == DeviceMode::Ps1Spu);
         self.frame_counter = 0;
     }
 
@@ -480,7 +484,7 @@ impl Device {
         let ch = base.channel(voice);
         Ok(VoiceState {
             pitch: ch.pitch,
-            envx: (ch.adsr_volume >> 16) as u16,
+            envx: ch.adsr_envx as u16,
             envelope_phase: ch.status,
             reached_end: ((base.end_flags() >> voice) & 1) != 0,
             start_address: ch.address,

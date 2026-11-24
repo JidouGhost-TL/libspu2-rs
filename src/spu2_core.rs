@@ -167,9 +167,11 @@ impl Spu2Core {
             registers::A_TSA_LO => get_address_lo(self.base.transfer_address()),
             registers::A_ESA_HI => get_address_hi(self.base.reverb_work_address_start()),
             registers::A_ESA_LO => get_address_lo(self.base.reverb_work_address_start()),
-            registers::A_EEA_HI => get_address_hi(self.base.reverb_work_address_end()),
-            registers::P_MVOLL => self.base.master_vol_l,
-            registers::P_MVOLR => self.base.master_vol_r,
+            registers::A_EEA_HI => {
+                get_address_hi(self.base.reverb_work_address_end().saturating_sub(1))
+            }
+            registers::P_MVOLL => self.base.master_vol_l.raw(),
+            registers::P_MVOLR => self.base.master_vol_r.raw(),
             registers::P_EVOLL => self.base.reverb_vol_l as u16,
             registers::P_EVOLR => self.base.reverb_vol_r as u16,
             registers::P_AVOLL => self.base.ext_input_vol_l as u16,
@@ -279,14 +281,14 @@ impl Spu2Core {
                 self.base.set_reverb_work_address_start(addr);
             }
             registers::A_EEA_HI => {
-                let addr = (((value as u32) & 0x0F) << 17) | 0x1FFFF;
+                let addr = (((value as u32) & 0x0F) + 1) << 17;
                 self.base.set_reverb_work_address_end(addr);
             }
             registers::P_MVOLL => {
-                self.base.master_vol_l = value;
+                self.base.set_master_vol_l(value);
             }
             registers::P_MVOLR => {
-                self.base.master_vol_r = value;
+                self.base.set_master_vol_r(value);
             }
             registers::P_EVOLL => {
                 self.base.set_reverb_vol_l(value as i16);
@@ -295,16 +297,16 @@ impl Spu2Core {
                 self.base.set_reverb_vol_r(value as i16);
             }
             registers::P_AVOLL => {
-                self.base.ext_input_vol_l = value as i32;
+                self.base.ext_input_vol_l = (value as i16) as i32;
             }
             registers::P_AVOLR => {
-                self.base.ext_input_vol_r = value as i32;
+                self.base.ext_input_vol_r = (value as i16) as i32;
             }
             registers::P_BVOLL => {
-                self.base.input_vol_l = value as i32;
+                self.base.input_vol_l = (value as i16) as i32;
             }
             registers::P_BVOLR => {
-                self.base.input_vol_r = value as i32;
+                self.base.input_vol_r = (value as i16) as i32;
             }
             _ => {}
         }
@@ -321,7 +323,7 @@ impl Spu2Core {
             registers::VP_PITCH => ch.pitch,
             registers::VP_ADSR1 => ch.adsr_level.raw(),
             registers::VP_ADSR2 => ch.adsr_rate.raw(),
-            registers::VP_ENVX => (ch.adsr_volume >> 16) as u16,
+            registers::VP_ENVX => ch.adsr_envx as u16,
             registers::VP_VOLXL => (ch.volume_left_abs >> 16) as u16,
             registers::VP_VOLXR => (ch.volume_right_abs >> 16) as u16,
             registers::VA_SSA_HI => get_address_hi(ch.address),
@@ -352,7 +354,7 @@ impl Spu2Core {
                 self.base.channel_mut(channel_id).adsr_rate = AdsrRate(value);
             }
             registers::VP_ENVX => {
-                self.base.channel_mut(channel_id).adsr_volume = (value as u32) << 16;
+                self.base.channel_mut(channel_id).adsr_envx = (value as i16) as i32;
             }
             registers::VA_SSA_HI => {
                 let ch = self.base.channel_mut(channel_id);

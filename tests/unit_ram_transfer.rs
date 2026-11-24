@@ -5,7 +5,7 @@ mod common;
 use libspu2::{Device, RAM_SIZE};
 
 fn key_on_voice0(d: &mut Device, addr: u32) {
-    d.write_register(0x19A, 0x8000).unwrap();
+    d.write_register(0x19A, 0xC000).unwrap();
     d.write_register(0x000, 0x3FFF).unwrap();
     d.write_register(0x002, 0x3FFF).unwrap();
     d.write_register(0x004, 0x1000).unwrap();

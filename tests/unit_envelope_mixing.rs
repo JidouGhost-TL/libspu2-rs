@@ -16,7 +16,7 @@ fn render(d: &mut Device, frames: usize) {
 }
 
 fn setup_voice(d: &mut Device, adsr1: u16, adsr2: u16, vol_l: u16, vol_r: u16) {
-    d.write_register(0x19A, 0x8000).unwrap();
+    d.write_register(0x19A, 0xC000).unwrap();
     d.write_register(0x000, vol_l).unwrap();
     d.write_register(0x002, vol_r).unwrap();
     d.write_register(0x004, 0x1000).unwrap();
@@ -42,14 +42,14 @@ fn adsr_slow_attack_lags_fast_attack() {
 }
 
 #[test]
-fn envx_nonzero_immediately_after_keyon() {
+fn envx_zero_immediately_after_keyon() {
     let mut d = Device::new();
     upload_loop(&mut d, 0x5000);
-    d.write_register(0x19A, 0x8000).unwrap();
+    d.write_register(0x19A, 0xC000).unwrap();
     d.write_register(0x006, 0x000F).unwrap();
     d.write_register(0x1C2, 0x5000 >> 1).unwrap();
     d.write_register(0x1A0, 1).unwrap();
-    assert_ne!(d.read_register(0x00A).unwrap(), 0);
+    assert_eq!(d.read_register(0x00A).unwrap(), 0);
 }
 
 #[test]
@@ -97,7 +97,7 @@ fn reverb_toggle_changes_output() {
     let run = |reverb: bool| -> u64 {
         let mut d = Device::new();
         upload_loop(&mut d, 0x5000);
-        d.write_register(0x19A, if reverb { 0x80C0 } else { 0x8000 })
+        d.write_register(0x19A, if reverb { 0xC0C0 } else { 0xC000 })
             .unwrap();
         if reverb {
             d.write_register(0x2E0, 0x000C).unwrap();

@@ -1,7 +1,7 @@
 # One voice, looped 440 Hz sine, unity pitch, 1 second.
 reset
 ram_file 5000 data/sine440_loop.bin
-reg 0 19A 8000
+reg 0 19A C000
 reg 0 000 3FFF
 reg 0 002 3FFF
 reg 0 004 1000

@@ -8,7 +8,7 @@
 use crate::inspect::EnvelopePhase;
 use crate::registers::{
     CONTROL_DMA_READ, CONTROL_DMA_STOP, CONTROL_ENABLE, CONTROL_IRQ, CONTROL_REVERB,
-    TRANSFER_MODE_BLOCK_CORE0IN, TRANSFER_MODE_BLOCK_CORE1IN, TRANSFER_MODE_VOICE,
+    CONTROL_UNMUTE, TRANSFER_MODE_BLOCK_CORE0IN, TRANSFER_MODE_BLOCK_CORE1IN, TRANSFER_MODE_VOICE,
 };
 
 pub const MAX_CHANNEL: usize = 24;
@@ -20,7 +20,8 @@ const INIT_SAMPLE_RATE: u32 = 44_100;
 const PITCH_BASE: u32 = 0x1000;
 const TIME_SCALE: u32 = 0x1000;
 const RESET_IRQ_ADDR: u32 = !0u32;
-const MAX_ADSR_VOLUME: u32 = 0x7FFF_FFFF;
+const MAX_ADSR_LEVEL: i32 = 0x7FFF;
+const CAPTURE_BUFFER_SIZE: u32 = 0x400;
 
 const CORE0_SIN_LEFT: u32 = 0x000;
 const CORE1_SIN_LEFT: u32 = 0x800;
@@ -132,33 +133,22 @@ impl ReverbParam {
     }
 }
 
-/// Compile-time 256-entry ADSR log delta table (indices 0..160 populated, 160..256 zero).
-const ADSR_LOG_TABLE: [u32; 256] = {
-    let mut table = [0u32; 256];
-    let mut value = 3u32;
-    let mut column_increment = 1u32;
-    let mut column = 0u32;
-    let mut i = 32usize;
-    while i < 160 {
-        if value < 0x3FFF_FFFF {
-            value += column_increment;
-            column += 1;
-            if column == 5 {
-                column = 1;
-                column_increment *= 2;
-            }
-        } else {
-            value = 0x3FFF_FFFF;
-        }
-        table[i] = value;
-        i += 1;
-    }
-    table
-};
+/// Symmetric half-band 39-tap FIR filter odd-offset coefficients (offsets ±19, ±17, ..., ±1).
+/// Center tap (offset 0) is `0x4000`; all other even-offset taps are `0`.
+const REVERB_FIR_ODD_TAPS: [i32; 10] = [
+    -0x0001, 0x0002, -0x000A, 0x0023, -0x0067, 0x010A, -0x0268, 0x0534, -0x0B90, 0x2806,
+];
+const REVERB_FIR_CENTER_TAP: i32 = 0x4000;
 
 #[inline]
-const fn get_adsr_delta(index: u32) -> u32 {
-    ADSR_LOG_TABLE[(index.wrapping_add(32) & 0xFF) as usize]
+const fn clamp16(v: i32) -> i32 {
+    if v < i16::MIN as i32 {
+        i16::MIN as i32
+    } else if v > i16::MAX as i32 {
+        i16::MAX as i32
+    } else {
+        v
+    }
 }
 
 const LINEAR_INCREASE_SWEEP_DELTAS: [u32; 0x80] = [
@@ -790,7 +780,8 @@ pub struct Channel {
     pub address: u32,
     pub adsr_level: AdsrLevel,
     pub adsr_rate: AdsrRate,
-    pub adsr_volume: u32,
+    pub adsr_envx: i32,
+    pub adsr_cycles: i32,
     pub repeat: u32,
     pub repeat_set: bool,
     pub status: EnvelopePhase,
@@ -817,6 +808,15 @@ impl Channel {
 
 const GAUSS_HISTORY: usize = 3;
 
+#[derive(Clone, Copy, Default)]
+struct HalfBlockMeta {
+    addr: u32,
+    end_flag: bool,
+    done: bool,
+    repeat_set: bool,
+    repeat_addr: u32,
+}
+
 #[derive(Clone)]
 struct SampleReader {
     ram_size: u32,
@@ -826,7 +826,10 @@ struct SampleReader {
     dst_sampling_rate: u32,
     next_sample_addr: u32,
     repeat_addr: u32,
+    latched_repeat_addr: u32,
     buffer: [i16; GAUSS_HISTORY + BUFFER_SAMPLES * 2],
+    cur_meta: HalfBlockMeta,
+    next_meta: HalfBlockMeta,
     s1: i32,
     s2: i32,
     done: bool,
@@ -846,7 +849,10 @@ impl SampleReader {
             dst_sampling_rate: 0,
             next_sample_addr: 0,
             repeat_addr: 0,
+            latched_repeat_addr: 0,
             buffer: [0; GAUSS_HISTORY + BUFFER_SAMPLES * 2],
+            cur_meta: HalfBlockMeta::default(),
+            next_meta: HalfBlockMeta::default(),
             s1: 0,
             s2: 0,
             done: false,
@@ -859,7 +865,10 @@ impl SampleReader {
     fn reset(&mut self) {
         self.next_sample_addr = 0;
         self.repeat_addr = 0;
+        self.latched_repeat_addr = 0;
         self.buffer = [0; GAUSS_HISTORY + BUFFER_SAMPLES * 2];
+        self.cur_meta = HalfBlockMeta::default();
+        self.next_meta = HalfBlockMeta::default();
         self.src_sample_idx = 0;
         self.src_sampling_rate = 0;
         self.dst_sampling_rate = 0;
@@ -890,6 +899,12 @@ impl SampleReader {
         self.src_sample_idx = 0;
         self.next_sample_addr = address & mask;
         self.repeat_addr = repeat & mask;
+        self.latched_repeat_addr = self.repeat_addr;
+        self.cur_meta = HalfBlockMeta {
+            addr: self.next_sample_addr,
+            ..HalfBlockMeta::default()
+        };
+        self.next_meta = HalfBlockMeta::default();
         self.s1 = 0;
         self.s2 = 0;
         self.next_valid = false;
@@ -915,7 +930,7 @@ impl SampleReader {
     }
 
     fn set_pitch(&mut self, base_sampling_rate: u32, pitch: u16) {
-        self.src_sampling_rate = base_sampling_rate.wrapping_mul(pitch as u32);
+        self.src_sampling_rate = base_sampling_rate.wrapping_mul(pitch.min(0x3FFF) as u32);
         self.update_sample_step();
     }
 
@@ -928,7 +943,7 @@ impl SampleReader {
     #[inline]
     fn step_for_pitch(&self, base_sampling_rate: u32, pitch: u16) -> u32 {
         base_sampling_rate
-            .wrapping_mul(pitch as u32)
+            .wrapping_mul(pitch.min(0x3FFF) as u32)
             .checked_div(self.dst_sampling_rate)
             .unwrap_or(0)
     }
@@ -948,11 +963,16 @@ impl SampleReader {
         let s1 = window[1] as i32; // older
         let s2 = window[2] as i32; // old
         let s3 = window[3] as i32; // new
-        let sum = GAUSS_TABLE[0x0FF - gauss_idx] * s0
-            + GAUSS_TABLE[0x1FF - gauss_idx] * s1
-            + GAUSS_TABLE[0x100 + gauss_idx] * s2
-            + GAUSS_TABLE[gauss_idx] * s3;
-        let result_sample = (sum >> 15).clamp(i16::MIN as i32, i16::MAX as i32);
+        let g0 = GAUSS_TABLE[0x0FF - gauss_idx];
+        let g1 = GAUSS_TABLE[0x1FF - gauss_idx];
+        let g2 = GAUSS_TABLE[0x100 + gauss_idx];
+        let g3 = GAUSS_TABLE[gauss_idx];
+        // CXD2922Q silicon: per-term arithmetic >> 15, 16-bit wrap on first 3 terms,
+        // 16-bit signed saturation on the 4th term.
+        let mut out = (((g0 * s0) >> 15) as i16)
+            .wrapping_add(((g1 * s1) >> 15) as i16)
+            .wrapping_add(((g2 * s2) >> 15) as i16) as i32;
+        out = clamp16(out + ((g3 * s3) >> 15));
 
         let step = step_override.unwrap_or(self.sample_step);
         let mut next_idx = (self.src_sample_idx as u64) + (step as u64);
@@ -967,7 +987,7 @@ impl SampleReader {
             self.advance_buffer(ram, cache, irq_watcher);
         }
         self.src_sample_idx = next_idx as u32;
-        result_sample
+        out
     }
 
     fn advance_buffer(
@@ -977,13 +997,31 @@ impl SampleReader {
         irq_watcher: &mut SpuIrqWatcher,
     ) {
         if self.next_valid {
+            // Commit end/done flags from the block that just finished playing.
+            if self.cur_meta.end_flag {
+                self.end_flag = true;
+            }
+            if self.cur_meta.done {
+                self.done = true;
+            }
             self.buffer
                 .copy_within(BUFFER_SAMPLES..(GAUSS_HISTORY + BUFFER_SAMPLES * 2), 0);
-            self.unpack_into_half(GAUSS_HISTORY + BUFFER_SAMPLES, ram, cache, irq_watcher);
+            self.cur_meta = self.next_meta;
+            if self.cur_meta.repeat_set {
+                self.latched_repeat_addr = self.cur_meta.repeat_addr;
+                self.did_change_repeat = true;
+            }
+            self.next_meta =
+                self.unpack_into_half(GAUSS_HISTORY + BUFFER_SAMPLES, ram, cache, irq_watcher);
         } else {
             self.buffer[..GAUSS_HISTORY].fill(0);
-            self.unpack_into_half(GAUSS_HISTORY, ram, cache, irq_watcher);
-            self.unpack_into_half(GAUSS_HISTORY + BUFFER_SAMPLES, ram, cache, irq_watcher);
+            self.cur_meta = self.unpack_into_half(GAUSS_HISTORY, ram, cache, irq_watcher);
+            if self.cur_meta.repeat_set {
+                self.latched_repeat_addr = self.cur_meta.repeat_addr;
+                self.did_change_repeat = true;
+            }
+            self.next_meta =
+                self.unpack_into_half(GAUSS_HISTORY + BUFFER_SAMPLES, ram, cache, irq_watcher);
             self.next_valid = true;
         }
     }
@@ -994,23 +1032,27 @@ impl SampleReader {
         ram: &[u8],
         cache: &mut SpuSampleCache,
         irq_watcher: &mut SpuIrqWatcher,
-    ) {
+    ) -> HalfBlockMeta {
         let mask = (self.ram_size - 1) as usize;
-        let base_addr = (self.next_sample_addr as usize) & mask;
+        let block_addr = self.next_sample_addr;
+        let base_addr = (block_addr as usize) & mask;
 
-        irq_watcher.check_irq(self.next_sample_addr);
+        irq_watcher.check_irq(block_addr);
 
         let header = ram[base_addr];
         let flags = ram[(base_addr + 1) & mask];
-        let shift_factor = (header & 0x0F) as u32;
+        let mut shift_factor = (header & 0x0F) as u32;
+        if shift_factor > 12 {
+            shift_factor = 9;
+        }
         let predict_number = (header >> 4) as usize;
 
         let mut cache_key = CacheKey {
-            address: self.next_sample_addr,
+            address: block_addr,
             s1: self.s1,
             s2: self.s2,
         };
-        if predict_number == 0 {
+        if predict_number == 0 || predict_number >= 5 {
             cache_key.s1 = 0;
             cache_key.s2 = 0;
         }
@@ -1030,21 +1072,19 @@ impl SampleReader {
                 let first_sample = (((sample_byte & 0x0F) as u16) << 12) as i16;
                 let second_sample = (((sample_byte & 0xF0) as u16) << 8) as i16;
 
-                let w0 = (first_sample as i32) >> shift_factor;
-                let mut v0 = w0.wrapping_mul(64);
-                v0 = v0.wrapping_add(s1.wrapping_mul(k0) / 64);
-                v0 = v0.wrapping_add(s2.wrapping_mul(k1) / 64);
+                let sample0 = clamp16(
+                    ((first_sample as i32) >> shift_factor) + ((s1 * k0 + s2 * k1 + 32) >> 6),
+                );
                 s2 = s1;
-                s1 = v0;
-                out[0] = (v0.wrapping_add(32) / 64).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                s1 = sample0;
+                out[0] = sample0 as i16;
 
-                let w1 = (second_sample as i32) >> shift_factor;
-                let mut v1 = w1.wrapping_mul(64);
-                v1 = v1.wrapping_add(s1.wrapping_mul(k0) / 64);
-                v1 = v1.wrapping_add(s2.wrapping_mul(k1) / 64);
+                let sample1 = clamp16(
+                    ((second_sample as i32) >> shift_factor) + ((s1 * k0 + s2 * k1 + 32) >> 6),
+                );
                 s2 = s1;
-                s1 = v1;
-                out[1] = (v1.wrapping_add(32) / 64).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                s1 = sample1;
+                out[1] = sample1 as i16;
             };
 
             if base_addr + 16 <= ram.len() {
@@ -1066,24 +1106,35 @@ impl SampleReader {
             cache.register_item(cache_key, cached, s1, s2);
         }
 
+        let mut meta = HalfBlockMeta {
+            addr: block_addr,
+            end_flag: false,
+            done: false,
+            repeat_set: false,
+            repeat_addr: self.repeat_addr,
+        };
+
         if (flags & 0x04) != 0 {
-            self.repeat_addr = self.next_sample_addr;
-            self.did_change_repeat = true;
+            self.repeat_addr = block_addr;
+            meta.repeat_set = true;
+            meta.repeat_addr = block_addr;
         }
 
-        self.next_sample_addr = self.next_sample_addr.wrapping_add(0x10) & (self.ram_size - 1);
+        self.next_sample_addr = block_addr.wrapping_add(0x10) & (self.ram_size - 1);
 
         if (flags & 0x01) != 0 {
-            self.end_flag = true;
+            meta.end_flag = true;
             self.next_sample_addr = self.repeat_addr;
             if (flags & 0x03) != 0x03 {
-                self.done = true;
+                meta.done = true;
             }
         }
+
+        meta
     }
 
     fn repeat(&self) -> u32 {
-        self.repeat_addr
+        self.latched_repeat_addr
     }
 
     fn set_repeat(&mut self, repeat_addr: u32) {
@@ -1092,7 +1143,7 @@ impl SampleReader {
 
     fn current(&self) -> u32 {
         let intra_sample_idx = ((self.src_sample_idx / PITCH_BASE) / 2).min(0x0E);
-        self.next_sample_addr.wrapping_add(intra_sample_idx)
+        self.cur_meta.addr.wrapping_add(intra_sample_idx)
     }
 
     fn is_done(&self) -> bool {
@@ -1235,9 +1286,13 @@ pub struct SpuBase {
     ctrl: u16,
     reverb_ticks: i32,
     reverb: [u32; REVERB_PARAM_COUNT],
-    reverb_coefs: [f32; REVERB_PARAM_COUNT],
-    reverb_cached_out: [i32; 2],
-    reverb_cached_valid: bool,
+    reverb_in_buf: [[i16; 64]; 2],
+    reverb_in_pos: usize,
+    reverb_out_buf: [[i16; 32]; 2],
+    reverb_out_pos: usize,
+
+    ps1_capture: bool,
+    capture_offset: u32,
 
     channels: [Channel; MAX_CHANNEL],
     readers: [SampleReader; MAX_CHANNEL],
@@ -1246,8 +1301,10 @@ pub struct SpuBase {
     sound_input_data_addr: u32,
     block_write_ptr: u32,
 
-    pub master_vol_l: u16,
-    pub master_vol_r: u16,
+    pub master_vol_l: ChannelVolume,
+    pub master_vol_r: ChannelVolume,
+    pub master_vol_l_abs: i32,
+    pub master_vol_r_abs: i32,
     pub reverb_vol_l: i16,
     pub reverb_vol_r: i16,
     pub input_vol_l: i32,
@@ -1262,6 +1319,7 @@ const DEFAULT_REVERB_VOL: i16 = 0x2AAA;
 impl SpuBase {
     pub fn new(spu_number: usize, ram_size: u32) -> Self {
         assert!(ram_size.is_power_of_two() && ram_size >= 0x4000);
+        let default_mvol = ChannelVolume(DEFAULT_MASTER_VOL);
         Self {
             ram_size,
             spu_number,
@@ -1282,9 +1340,12 @@ impl SpuBase {
             ctrl: 0,
             reverb_ticks: 0,
             reverb: [0; REVERB_PARAM_COUNT],
-            reverb_coefs: [0.0; REVERB_PARAM_COUNT],
-            reverb_cached_out: [0, 0],
-            reverb_cached_valid: false,
+            reverb_in_buf: [[0; 64]; 2],
+            reverb_in_pos: 0,
+            reverb_out_buf: [[0; 32]; 2],
+            reverb_out_pos: 0,
+            ps1_capture: false,
+            capture_offset: 0,
             channels: [Channel::default(); MAX_CHANNEL],
             readers: std::array::from_fn(|_| SampleReader::new(ram_size)),
             block_reader: BlockSampleReader::new(),
@@ -1294,8 +1355,10 @@ impl SpuBase {
                 SOUND_INPUT_DATA_CORE1_BASE
             },
             block_write_ptr: 0,
-            master_vol_l: DEFAULT_MASTER_VOL,
-            master_vol_r: DEFAULT_MASTER_VOL,
+            master_vol_l: default_mvol,
+            master_vol_r: default_mvol,
+            master_vol_l_abs: default_mvol.fixed_volume_i32(),
+            master_vol_r_abs: default_mvol.fixed_volume_i32(),
             reverb_vol_l: DEFAULT_REVERB_VOL,
             reverb_vol_r: DEFAULT_REVERB_VOL,
             input_vol_l: 0x7FFF,
@@ -1323,8 +1386,11 @@ impl SpuBase {
         self.reverb_work_addr_end = 0x80000;
         self.base_sampling_rate = INIT_SAMPLE_RATE;
 
-        self.master_vol_l = DEFAULT_MASTER_VOL;
-        self.master_vol_r = DEFAULT_MASTER_VOL;
+        let default_mvol = ChannelVolume(DEFAULT_MASTER_VOL);
+        self.master_vol_l = default_mvol;
+        self.master_vol_r = default_mvol;
+        self.master_vol_l_abs = default_mvol.fixed_volume_i32();
+        self.master_vol_r_abs = default_mvol.fixed_volume_i32();
         self.reverb_vol_l = DEFAULT_REVERB_VOL;
         self.reverb_vol_r = DEFAULT_REVERB_VOL;
         self.input_vol_l = 0x7FFF;
@@ -1334,9 +1400,11 @@ impl SpuBase {
 
         self.channels = [Channel::default(); MAX_CHANNEL];
         self.reverb = [0; REVERB_PARAM_COUNT];
-        self.reverb_coefs = [0.0; REVERB_PARAM_COUNT];
-        self.reverb_cached_out = [0, 0];
-        self.reverb_cached_valid = false;
+        self.reverb_in_buf = [[0; 64]; 2];
+        self.reverb_in_pos = 0;
+        self.reverb_out_buf = [[0; 32]; 2];
+        self.reverb_out_pos = 0;
+        self.capture_offset = 0;
 
         for reader in &mut self.readers {
             reader.reset();
@@ -1351,6 +1419,31 @@ impl SpuBase {
         self.block_write_ptr = 0;
     }
 
+    pub fn set_ps1_capture(&mut self, enabled: bool) {
+        self.ps1_capture = enabled;
+    }
+
+    #[inline]
+    pub fn capture_second_half(&self) -> bool {
+        (self.capture_offset & (CAPTURE_BUFFER_SIZE / 2)) != 0
+    }
+
+    #[inline]
+    pub fn set_master_vol_l(&mut self, value: u16) {
+        self.master_vol_l = ChannelVolume(value);
+        if !self.master_vol_l.is_sweep() {
+            self.master_vol_l_abs = self.master_vol_l.fixed_volume_i32();
+        }
+    }
+
+    #[inline]
+    pub fn set_master_vol_r(&mut self, value: u16) {
+        self.master_vol_r = ChannelVolume(value);
+        if !self.master_vol_r.is_sweep() {
+            self.master_vol_r_abs = self.master_vol_r.fixed_volume_i32();
+        }
+    }
+
     #[inline]
     pub fn is_enabled(&self) -> bool {
         (self.ctrl & CONTROL_ENABLE) != 0
@@ -1362,6 +1455,9 @@ impl SpuBase {
         if (self.ctrl & (CONTROL_REVERB | CONTROL_IRQ)) != 0 {
             return false;
         }
+        if self.master_vol_l.is_sweep() || self.master_vol_r.is_sweep() {
+            return false;
+        }
         if self.block_reader.can_read_samples()
             || self.block_write_ptr as usize == SOUND_INPUT_DATA_SIZE
         {
@@ -1370,7 +1466,7 @@ impl SpuBase {
         for i in 0..MAX_CHANNEL {
             let ch = &self.channels[i];
             if ch.status != EnvelopePhase::Stopped
-                || (ch.adsr_volume >> 16) != 0
+                || ch.adsr_envx != 0
                 || !self.readers[i].is_inert()
                 || ch.volume_left.is_sweep()
                 || ch.volume_right.is_sweep()
@@ -1482,12 +1578,10 @@ impl SpuBase {
 
     pub fn set_reverb_vol_l(&mut self, value: i16) {
         self.reverb_vol_l = value;
-        self.reverb_cached_valid = false;
     }
 
     pub fn set_reverb_vol_r(&mut self, value: i16) {
         self.reverb_vol_r = value;
-        self.reverb_cached_valid = false;
     }
 
     #[inline]
@@ -1496,10 +1590,7 @@ impl SpuBase {
     }
 
     pub(crate) fn set_reverb_param(&mut self, param: ReverbParam, value: u32) {
-        let idx = param as usize;
-        self.reverb[idx] = value;
-        self.reverb_coefs[idx] = ((value as i16) as f32) / (0x8000 as f32);
-        self.reverb_cached_valid = false;
+        self.reverb[param as usize] = value;
     }
 
     pub fn end_flags(&self) -> u32 {
@@ -1537,12 +1628,12 @@ impl SpuBase {
             let i = mask.trailing_zeros() as usize;
             mask &= mask - 1;
             let ch = &mut self.channels[i];
-            let attack_rate = ch.adsr_level.attack_rate();
-            let preloaded = get_adsr_delta((attack_rate ^ 0x7F).wrapping_sub(0x10));
             ch.status = EnvelopePhase::KeyOn;
             ch.repeat_set = false;
             ch.current = ch.address;
-            ch.adsr_volume = preloaded;
+            ch.adsr_envx = 0;
+            ch.adsr_cycles = 0;
+            self.readers[i].clear_end_flag();
         }
     }
 
@@ -1563,6 +1654,7 @@ impl SpuBase {
                 }
                 _ => {
                     ch.status = EnvelopePhase::Release;
+                    ch.adsr_cycles = 0;
                 }
             }
         }
@@ -1575,7 +1667,6 @@ impl SpuBase {
     pub fn set_reverb_work_address_start(&mut self, address: u32) {
         self.reverb_work_addr_start = address;
         self.reverb_curr_addr = address;
-        self.reverb_cached_valid = false;
     }
 
     pub fn reverb_work_address_end(&self) -> u32 {
@@ -1584,7 +1675,6 @@ impl SpuBase {
 
     pub fn set_reverb_work_address_end(&mut self, address: u32) {
         self.reverb_work_addr_end = address;
-        self.reverb_cached_valid = false;
     }
 
     pub fn write_word(&mut self, value: u16, ram: &mut [u8], cache: &mut SpuSampleCache) {
@@ -1684,10 +1774,8 @@ impl SpuBase {
 
     #[inline]
     pub fn mix_samples(input_sample: i32, volume_level: i32, output: &mut i16) {
-        let scaled = input_sample.wrapping_mul(volume_level) / 0x7FFF;
-        let result = scaled
-            .wrapping_add(*output as i32)
-            .clamp(i16::MIN as i32, i16::MAX as i32);
+        let scaled = input_sample.wrapping_mul(volume_level) >> 15;
+        let result = clamp16(scaled.wrapping_add(*output as i32));
         *output = result as i16;
     }
 
@@ -1708,7 +1796,7 @@ impl SpuBase {
         let update_reverb = ((self.ctrl & CONTROL_REVERB) != 0)
             && (self.reverb_work_addr_start < self.reverb_work_addr_end);
         let irq_enabled = (self.ctrl & CONTROL_IRQ) != 0;
-        self.reverb_cached_valid = false;
+        let unmuted = (self.ctrl & CONTROL_UNMUTE) != 0;
 
         // Build active-voice bitmask; sync inert voices once outside the hot loop.
         let mut active_mask = 0u32;
@@ -1716,7 +1804,7 @@ impl SpuBase {
             let ch = &mut self.channels[i];
             let reader = &mut self.readers[i];
             if ch.status == EnvelopePhase::Stopped
-                && (ch.adsr_volume >> 16) == 0
+                && ch.adsr_envx == 0
                 && reader.is_inert()
                 && !ch.volume_left.is_sweep()
                 && !ch.volume_right.is_sweep()
@@ -1733,13 +1821,11 @@ impl SpuBase {
         }
 
         let check_core0_irq = self.spu_number == 0
+            && !self.ps1_capture
             && irq_enabled
             && (self.irq_addr < CORE0_OUTPUT_SIZE
                 || (CORE1_SIN_LEFT..CORE1_SIN_LEFT + CORE0_OUTPUT_SIZE).contains(&self.irq_addr)
                 || (CORE1_SIN_RIGHT..CORE1_SIN_RIGHT + CORE0_OUTPUT_SIZE).contains(&self.irq_addr));
-
-        let master_l = ((self.master_vol_l << 1) as i16) as i32;
-        let master_r = ((self.master_vol_r << 1) as i16) as i32;
 
         for frame in samples.chunks_exact_mut(2) {
             self.step_noise();
@@ -1761,11 +1847,16 @@ impl SpuBase {
                     reader.set_params_read(ch.address, ch.repeat, ram, cache, irq_watcher);
                     reader.clear_end_flag();
                     ch.status = EnvelopePhase::Attack;
-                    ch.adsr_volume = 0;
+                    ch.adsr_envx = 0;
+                    ch.adsr_cycles = 0;
+                    if reader.did_change_repeat() && !ch.repeat_set {
+                        ch.repeat = reader.repeat();
+                        reader.clear_did_change_repeat();
+                    }
                 } else {
                     if reader.is_done() {
                         ch.status = EnvelopePhase::Stopped;
-                        ch.adsr_volume = 0;
+                        ch.adsr_envx = 0;
                         reader.clear_is_done();
                     }
                     if reader.did_change_repeat() && !ch.repeat_set {
@@ -1776,9 +1867,9 @@ impl SpuBase {
                 }
 
                 let step_override = if i > 0 && ((self.channel_pmon & (1 << i)) != 0) {
+                    let step = (ch.pitch as i16) as i32;
                     let factor = (voice_out[i - 1] as i32) + 0x8000;
-                    let modulated_pitch =
-                        (((ch.pitch as i32) * factor) >> 15).clamp(0, 0x3FFF) as u16;
+                    let modulated_pitch = (((step * factor) >> 15) & 0xFFFF).min(0x3FFF) as u16;
                     Some(reader.step_for_pitch(self.base_sampling_rate, modulated_pitch))
                 } else {
                     None
@@ -1802,10 +1893,8 @@ impl SpuBase {
                     continue;
                 }
 
-                let adsr_top = (ch.adsr_volume >> 16) as i32;
-                let max_adsr_top = (MAX_ADSR_VOLUME >> 16) as i32;
-                let input_sample = read_sample.wrapping_mul(adsr_top) / max_adsr_top;
-                voice_out[i] = input_sample.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                let input_sample = read_sample.wrapping_mul(ch.adsr_envx) >> 15;
+                voice_out[i] = clamp16(input_sample) as i16;
 
                 if input_sample == 0 {
                     continue;
@@ -1814,13 +1903,19 @@ impl SpuBase {
                 let volume_left = vol_l >> 16;
                 let volume_right = vol_r >> 16;
 
-                Self::mix_samples(input_sample, volume_left, &mut out_l);
-                Self::mix_samples(input_sample, volume_right, &mut out_r);
+                if unmuted {
+                    Self::mix_samples(input_sample, volume_left, &mut out_l);
+                    Self::mix_samples(input_sample, volume_right, &mut out_r);
+                }
 
                 if update_reverb && ((self.channel_reverb & (1 << i)) != 0) {
                     Self::mix_samples(input_sample, volume_left, &mut reverb_sample[0]);
                     Self::mix_samples(input_sample, volume_right, &mut reverb_sample[1]);
                 }
+            }
+
+            if self.ps1_capture {
+                self.write_ps1_capture(voice_out[1], voice_out[3], ram, cache, irq_watcher);
             }
 
             if !self.block_reader.can_read_samples()
@@ -1855,14 +1950,21 @@ impl SpuBase {
             }
 
             if update_reverb {
-                self.update_reverb(reverb_sample, &mut out_l, &mut out_r, ram);
+                self.update_reverb(reverb_sample, unmuted, &mut out_l, &mut out_r, ram);
             }
+
+            self.master_vol_l_abs =
+                Self::compute_channel_volume(self.master_vol_l, self.master_vol_l_abs);
+            self.master_vol_r_abs =
+                Self::compute_channel_volume(self.master_vol_r, self.master_vol_r_abs);
+            let master_l = self.master_vol_l_abs >> 16;
+            let master_r = self.master_vol_r_abs >> 16;
 
             frame[0] = Self::scale_master(out_l, master_l);
             frame[1] = Self::scale_master(out_r, master_r);
         }
 
-        if self.spu_number == 0 && !check_core0_irq {
+        if self.spu_number == 0 && !self.ps1_capture && !check_core0_irq {
             self.core0_output_offset = self
                 .core0_output_offset
                 .wrapping_add((ticks as u32).wrapping_mul(2))
@@ -1876,9 +1978,34 @@ impl SpuBase {
     }
 
     #[inline]
+    fn write_ps1_capture(
+        &mut self,
+        voice1: i16,
+        voice3: i16,
+        ram: &mut [u8],
+        cache: &mut SpuSampleCache,
+        irq_watcher: &mut SpuIrqWatcher,
+    ) {
+        let off = self.capture_offset as usize;
+        let writes: [(usize, i16); 4] = [
+            (off, 0),
+            (0x0400 + off, 0),
+            (0x0800 + off, voice1),
+            (0x0C00 + off, voice3),
+        ];
+        for (addr, sample) in writes {
+            let bytes = sample.to_le_bytes();
+            ram[addr] = bytes[0];
+            ram[addr + 1] = bytes[1];
+            cache.clear_range(addr as u32, 2);
+            irq_watcher.check_irq(addr as u32);
+        }
+        self.capture_offset = (self.capture_offset + 2) & (CAPTURE_BUFFER_SIZE - 2);
+    }
+
+    #[inline]
     fn scale_master(sample: i16, master_vol: i32) -> i16 {
-        (((sample as i32).wrapping_mul(master_vol)) / 0x7FFF)
-            .clamp(i16::MIN as i32, i16::MAX as i32) as i16
+        clamp16((sample as i32).wrapping_mul(master_vol) >> 15) as i16
     }
 
     #[inline]
@@ -1895,9 +2022,8 @@ impl SpuBase {
                 & 1;
             self.noise_level = (self.noise_level << 1) | parity;
             let reload = (0x20000i32 >> noise_shift).max(1);
-            self.noise_timer += reload;
-            if self.noise_timer < 0 {
-                self.noise_timer = 0;
+            while self.noise_timer < 0 {
+                self.noise_timer += reload;
             }
         }
     }
@@ -1926,302 +2052,322 @@ impl SpuBase {
         }
     }
 
+    /// Exact hardware 15-bit discrete cycle-counter ADSR envelope generator
+    /// (per Nocash PSX-SPX specification).
     #[inline]
     fn update_adsr(ch: &mut Channel) {
-        const LOG_INDEX: [u32; 8] = [0, 4, 6, 8, 9, 10, 11, 12];
-        let mut current = ch.adsr_volume as i32;
-
-        match ch.status {
+        let (shift, base_step, decreasing, exponential) = match ch.status {
             EnvelopePhase::Stopped | EnvelopePhase::KeyOn => return,
             EnvelopePhase::Attack => {
-                let delta = if !ch.adsr_level.attack_exponential() || current < 0x6000_0000 {
-                    get_adsr_delta((ch.adsr_level.attack_rate() ^ 0x7F).wrapping_sub(0x10))
-                } else {
-                    get_adsr_delta((ch.adsr_level.attack_rate() ^ 0x7F).wrapping_sub(0x18))
-                };
-                current = current.wrapping_add(delta as i32);
-                if current < 0 {
-                    current = MAX_ADSR_VOLUME as i32;
+                let rate = ch.adsr_level.attack_rate();
+                let shift = rate >> 2;
+                let step_idx = (rate & 3) as i32;
+                (
+                    shift,
+                    7 - step_idx,
+                    false,
+                    ch.adsr_level.attack_exponential(),
+                )
+            }
+            EnvelopePhase::Decay => {
+                let sustain_target = ((ch.adsr_level.sustain_level() + 1) * 0x800) as i32;
+                if ch.adsr_envx <= sustain_target {
+                    ch.status = EnvelopePhase::Sustain;
+                    ch.adsr_cycles = 0;
+                    return;
+                }
+                (ch.adsr_level.decay_rate(), -8, true, true)
+            }
+            EnvelopePhase::Sustain => {
+                let rate = ch.adsr_rate.sustain_rate();
+                let shift = rate >> 2;
+                let step_idx = (rate & 3) as i32;
+                let dec = ch.adsr_rate.sustain_decrease();
+                let base = if dec { -(8 - step_idx) } else { 7 - step_idx };
+                (shift, base, dec, ch.adsr_rate.sustain_exponential())
+            }
+            EnvelopePhase::Release => (
+                ch.adsr_rate.release_rate(),
+                -8,
+                true,
+                ch.adsr_rate.release_exponential(),
+            ),
+        };
+
+        ch.adsr_cycles = ch.adsr_cycles.wrapping_sub(1);
+        if ch.adsr_cycles > 0 {
+            return;
+        }
+
+        let mut adsr_cycles: i32 = 1i32 << shift.saturating_sub(11);
+        let mut adsr_step: i32 = base_step << 11u32.saturating_sub(shift);
+
+        if exponential {
+            if !decreasing {
+                if ch.adsr_envx > 0x6000 {
+                    adsr_cycles = adsr_cycles.saturating_mul(4);
+                }
+            } else {
+                adsr_step = (adsr_step * ch.adsr_envx) >> 15;
+            }
+        }
+
+        ch.adsr_cycles = adsr_cycles;
+        let next = (ch.adsr_envx + adsr_step).clamp(0, MAX_ADSR_LEVEL);
+        ch.adsr_envx = next;
+
+        match ch.status {
+            EnvelopePhase::Attack => {
+                if next >= MAX_ADSR_LEVEL {
                     ch.status = EnvelopePhase::Decay;
+                    ch.adsr_cycles = 0;
                 }
             }
             EnvelopePhase::Decay => {
-                let decay_type = ((current as u32) >> 28) & 0x7;
-                let idx = (4 * (ch.adsr_level.decay_rate() ^ 0x1F))
-                    .wrapping_sub(0x18)
-                    .wrapping_add(LOG_INDEX[decay_type as usize]);
-                let delta = get_adsr_delta(idx);
-                current = current.wrapping_sub(delta as i32);
-                if (((current >> 27) & 0xF) as u32) <= ch.adsr_level.sustain_level() {
+                let sustain_target = ((ch.adsr_level.sustain_level() + 1) * 0x800) as i32;
+                if next <= sustain_target {
                     ch.status = EnvelopePhase::Sustain;
-                }
-            }
-            EnvelopePhase::Sustain => {
-                if !ch.adsr_rate.sustain_decrease() {
-                    let delta = if !ch.adsr_rate.sustain_exponential() || current < 0x6000_0000 {
-                        get_adsr_delta((ch.adsr_rate.sustain_rate() ^ 0x7F).wrapping_sub(0x10))
-                    } else {
-                        get_adsr_delta((ch.adsr_rate.sustain_rate() ^ 0x7F).wrapping_sub(0x18))
-                    };
-                    current = current.wrapping_add(delta as i32);
-                    if current < 0 {
-                        current = MAX_ADSR_VOLUME as i32;
-                    }
-                } else {
-                    let delta = if !ch.adsr_rate.sustain_exponential() {
-                        get_adsr_delta((ch.adsr_rate.sustain_rate() ^ 0x7F).wrapping_sub(0x0F))
-                    } else {
-                        let sustain_type = ((current as u32) >> 28) & 0x7;
-                        let idx = (ch.adsr_rate.sustain_rate() ^ 0x7F)
-                            .wrapping_sub(0x1B)
-                            .wrapping_add(LOG_INDEX[sustain_type as usize]);
-                        get_adsr_delta(idx)
-                    };
-                    current = current.wrapping_sub(delta as i32);
-                    if current < 0 {
-                        current = 0;
-                    }
+                    ch.adsr_cycles = 0;
                 }
             }
             EnvelopePhase::Release => {
-                let delta = if !ch.adsr_rate.release_exponential() {
-                    get_adsr_delta((4 * (ch.adsr_rate.release_rate() ^ 0x1F)).wrapping_sub(0x0C))
-                } else {
-                    let release_type = ((current as u32) >> 28) & 0x7;
-                    let idx = (4 * (ch.adsr_rate.release_rate() ^ 0x1F))
-                        .wrapping_sub(0x18)
-                        .wrapping_add(LOG_INDEX[release_type as usize]);
-                    get_adsr_delta(idx)
-                };
-                current = current.wrapping_sub(delta as i32);
-                if current < 0 {
-                    current = 0;
+                if next <= 0 {
                     ch.status = EnvelopePhase::Stopped;
+                    ch.adsr_cycles = 0;
                 }
             }
+            EnvelopePhase::Sustain | EnvelopePhase::Stopped | EnvelopePhase::KeyOn => {}
         }
-
-        ch.adsr_volume = current as u32;
     }
 
     #[inline]
-    fn reverb_ram_addr(&self, address: u32) -> usize {
-        let mut absolute = self.reverb_curr_addr.wrapping_add(address);
-        if absolute >= self.reverb_work_addr_end {
-            let work_len = self.reverb_work_addr_end - self.reverb_work_addr_start;
-            absolute = absolute.wrapping_sub(work_len);
-            if absolute >= self.reverb_work_addr_end {
-                absolute = self.reverb_work_addr_start
-                    + (absolute.wrapping_sub(self.reverb_work_addr_start) % work_len);
-            }
-        }
+    fn reverb_ram_addr(&self, offset: i64) -> usize {
+        let work_len = (self.reverb_work_addr_end - self.reverb_work_addr_start) as i64;
+        let rel = (self.reverb_curr_addr - self.reverb_work_addr_start) as i64;
+        let wrapped = (rel + offset).rem_euclid(work_len) as u32;
+        let absolute = self.reverb_work_addr_start + wrapped;
         (absolute & (self.ram_size - 1)) as usize
     }
 
     #[inline]
-    fn get_reverb_sample(&self, address: u32, ram: &[u8]) -> f32 {
+    fn get_reverb_sample(&self, offset: i64, ram: &[u8]) -> i32 {
         let mask = (self.ram_size - 1) as usize;
-        let off = self.reverb_ram_addr(address);
-        let val = i16::from_le_bytes([ram[off], ram[(off + 1) & mask]]);
-        val as f32
+        let off = self.reverb_ram_addr(offset);
+        i16::from_le_bytes([ram[off], ram[(off + 1) & mask]]) as i32
     }
 
     #[inline]
-    fn set_reverb_sample(&self, address: u32, value: f32, ram: &mut [u8]) {
+    fn set_reverb_sample(&self, offset: i64, value: i32, ram: &mut [u8]) {
         let mask = (self.ram_size - 1) as usize;
-        let off = self.reverb_ram_addr(address);
-        let clamped = value.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-        let bytes = clamped.to_le_bytes();
+        let off = self.reverb_ram_addr(offset);
+        let bytes = (clamp16(value) as i16).to_le_bytes();
         ram[off] = bytes[0];
         ram[(off + 1) & mask] = bytes[1];
     }
 
     #[inline]
-    fn get_reverb_offset(&self, param: ReverbParam) -> u32 {
-        self.reverb[param as usize]
+    fn get_reverb_offset(&self, param: ReverbParam) -> i64 {
+        self.reverb[param as usize] as i64
     }
 
     #[inline]
-    fn get_reverb_coef(&self, param: ReverbParam) -> f32 {
-        self.reverb_coefs[param as usize]
+    fn get_reverb_coef(&self, param: ReverbParam) -> i32 {
+        (self.reverb[param as usize] as i16) as i32
     }
 
+    /// 39-tap symmetric half-band FIR downsample (44.1/48 kHz -> 22.05/24 kHz).
+    #[inline]
+    fn reverb_fir_downsample(&self, ch: usize) -> i32 {
+        let buf = &self.reverb_in_buf[ch];
+        let pos = self.reverb_in_pos;
+        let mut acc = REVERB_FIR_CENTER_TAP * (buf[pos.wrapping_sub(19) & 63] as i32);
+        for (j, &tap) in REVERB_FIR_ODD_TAPS.iter().enumerate() {
+            let a = buf[pos.wrapping_sub(38 - j * 2) & 63] as i32;
+            let b = buf[pos.wrapping_sub(j * 2) & 63] as i32;
+            acc += tap * (a + b);
+        }
+        clamp16(acc >> 15)
+    }
+
+    /// 39-tap symmetric half-band zero-stuffed FIR upsample (22.05/24 kHz -> 44.1/48 kHz).
+    #[inline]
+    fn reverb_fir_upsample(&self, ch: usize, is_odd: bool) -> i32 {
+        let buf = &self.reverb_out_buf[ch];
+        let pos = self.reverb_out_pos;
+        if is_odd {
+            let mut acc = 0i32;
+            for (j, &tap) in REVERB_FIR_ODD_TAPS.iter().enumerate() {
+                let a = buf[pos.wrapping_sub(19 - j) & 31] as i32;
+                let b = buf[pos.wrapping_sub(j) & 31] as i32;
+                acc += tap * (a + b);
+            }
+            clamp16(acc >> 14)
+        } else {
+            buf[pos.wrapping_sub(9) & 31] as i32
+        }
+    }
+
+    /// Hardware 16-bit saturating fixed-point reverb engine with 39-tap half-band FIR
+    /// downsample/upsample (per Nocash PSX-SPX specification).
     fn update_reverb(
         &mut self,
         reverb_sample: [i16; 2],
+        unmuted: bool,
         out_l: &mut i16,
         out_r: &mut i16,
         ram: &mut [u8],
     ) {
+        self.reverb_in_pos = (self.reverb_in_pos + 1) & 63;
+        self.reverb_in_buf[0][self.reverb_in_pos] = reverb_sample[0];
+        self.reverb_in_buf[1][self.reverb_in_pos] = reverb_sample[1];
+
         let is_odd = (self.reverb_ticks & 1) != 0;
         if is_odd {
-            let input_sample_l = (reverb_sample[0] as f32) * 0.5;
-            let input_sample_r = (reverb_sample[1] as f32) * 0.5;
+            let in_l = self.reverb_fir_downsample(0);
+            let in_r = self.reverb_fir_downsample(1);
 
-            let iir_coef = self.get_reverb_coef(ReverbParam::IirCoef);
-            let in_coef_l = self.get_reverb_coef(ReverbParam::InCoefL);
-            let in_coef_r = self.get_reverb_coef(ReverbParam::InCoefR);
+            let v_lin = self.get_reverb_coef(ReverbParam::InCoefL);
+            let v_rin = self.get_reverb_coef(ReverbParam::InCoefR);
+            let v_wall = self.get_reverb_coef(ReverbParam::IirCoef);
+            let v_iir = self.get_reverb_coef(ReverbParam::IirAlpha);
 
-            let iir_input_a0 = self
-                .get_reverb_sample(self.get_reverb_offset(ReverbParam::IirSrcA0), ram)
-                * iir_coef
-                + input_sample_l * in_coef_l;
-            let iir_input_a1 = self
-                .get_reverb_sample(self.get_reverb_offset(ReverbParam::IirSrcA1), ram)
-                * iir_coef
-                + input_sample_r * in_coef_r;
-            let iir_input_b0 = self
-                .get_reverb_sample(self.get_reverb_offset(ReverbParam::IirSrcB1), ram)
-                * iir_coef
-                + input_sample_l * in_coef_l;
-            let iir_input_b1 = self
-                .get_reverb_sample(self.get_reverb_offset(ReverbParam::IirSrcB0), ram)
-                * iir_coef
-                + input_sample_r * in_coef_r;
+            let lin = (in_l * v_lin) >> 15;
+            let rin = (in_r * v_rin) >> 15;
 
-            let iir_alpha = self.get_reverb_coef(ReverbParam::IirAlpha);
+            // Same-side reflection (IIR): read [m*SAME - 2], write [m*SAME].
+            let m_lsame = self.get_reverb_offset(ReverbParam::IirDestA0);
+            let m_rsame = self.get_reverb_offset(ReverbParam::IirDestA1);
+            let d_lsame = self.get_reverb_offset(ReverbParam::IirSrcA0);
+            let d_rsame = self.get_reverb_offset(ReverbParam::IirSrcA1);
 
-            let iir_a0 = iir_input_a0 * iir_alpha
-                + self.get_reverb_sample(self.get_reverb_offset(ReverbParam::IirDestA0), ram)
-                    * (1.0 - iir_alpha);
-            let iir_a1 = iir_input_a1 * iir_alpha
-                + self.get_reverb_sample(self.get_reverb_offset(ReverbParam::IirDestA1), ram)
-                    * (1.0 - iir_alpha);
-            let iir_b0 = iir_input_b0 * iir_alpha
-                + self.get_reverb_sample(self.get_reverb_offset(ReverbParam::IirDestB0), ram)
-                    * (1.0 - iir_alpha);
-            let iir_b1 = iir_input_b1 * iir_alpha
-                + self.get_reverb_sample(self.get_reverb_offset(ReverbParam::IirDestB1), ram)
-                    * (1.0 - iir_alpha);
+            let prev_lsame = self.get_reverb_sample(m_lsame - 2, ram);
+            let prev_rsame = self.get_reverb_sample(m_rsame - 2, ram);
+            let tmp_lsame =
+                clamp16(lin + ((self.get_reverb_sample(d_lsame, ram) * v_wall) >> 15) - prev_lsame);
+            let tmp_rsame =
+                clamp16(rin + ((self.get_reverb_sample(d_rsame, ram) * v_wall) >> 15) - prev_rsame);
+            let iir_lsame = clamp16(((tmp_lsame * v_iir) >> 15) + prev_lsame);
+            let iir_rsame = clamp16(((tmp_rsame * v_iir) >> 15) + prev_rsame);
 
-            self.set_reverb_sample(
-                self.get_reverb_offset(ReverbParam::IirDestA0)
-                    .wrapping_add(2),
-                iir_a0,
-                ram,
+            // Different-side reflection (cross-coupled IIR): dRDIFF -> mLDIFF, dLDIFF -> mRDIFF.
+            let m_ldiff = self.get_reverb_offset(ReverbParam::IirDestB0);
+            let m_rdiff = self.get_reverb_offset(ReverbParam::IirDestB1);
+            let d_ldiff = self.get_reverb_offset(ReverbParam::IirSrcB0);
+            let d_rdiff = self.get_reverb_offset(ReverbParam::IirSrcB1);
+
+            let prev_ldiff = self.get_reverb_sample(m_ldiff - 2, ram);
+            let prev_rdiff = self.get_reverb_sample(m_rdiff - 2, ram);
+            let tmp_ldiff =
+                clamp16(lin + ((self.get_reverb_sample(d_rdiff, ram) * v_wall) >> 15) - prev_ldiff);
+            let tmp_rdiff =
+                clamp16(rin + ((self.get_reverb_sample(d_ldiff, ram) * v_wall) >> 15) - prev_rdiff);
+            let iir_ldiff = clamp16(((tmp_ldiff * v_iir) >> 15) + prev_ldiff);
+            let iir_rdiff = clamp16(((tmp_rdiff * v_iir) >> 15) + prev_rdiff);
+
+            self.set_reverb_sample(m_lsame, iir_lsame, ram);
+            self.set_reverb_sample(m_rsame, iir_rsame, ram);
+            self.set_reverb_sample(m_ldiff, iir_ldiff, ram);
+            self.set_reverb_sample(m_rdiff, iir_rdiff, ram);
+
+            // Early echo (4-tap comb filter).
+            let v_comb1 = self.get_reverb_coef(ReverbParam::AccCoefA);
+            let v_comb2 = self.get_reverb_coef(ReverbParam::AccCoefB);
+            let v_comb3 = self.get_reverb_coef(ReverbParam::AccCoefC);
+            let v_comb4 = self.get_reverb_coef(ReverbParam::AccCoefD);
+
+            let comb_l = clamp16(
+                ((v_comb1
+                    * self.get_reverb_sample(self.get_reverb_offset(ReverbParam::AccSrcA0), ram))
+                    >> 15)
+                    + ((v_comb2
+                        * self.get_reverb_sample(
+                            self.get_reverb_offset(ReverbParam::AccSrcB0),
+                            ram,
+                        ))
+                        >> 15)
+                    + ((v_comb3
+                        * self.get_reverb_sample(
+                            self.get_reverb_offset(ReverbParam::AccSrcC0),
+                            ram,
+                        ))
+                        >> 15)
+                    + ((v_comb4
+                        * self.get_reverb_sample(
+                            self.get_reverb_offset(ReverbParam::AccSrcD0),
+                            ram,
+                        ))
+                        >> 15),
             );
-            self.set_reverb_sample(
-                self.get_reverb_offset(ReverbParam::IirDestA1)
-                    .wrapping_add(2),
-                iir_a1,
-                ram,
-            );
-            self.set_reverb_sample(
-                self.get_reverb_offset(ReverbParam::IirDestB0)
-                    .wrapping_add(2),
-                iir_b0,
-                ram,
-            );
-            self.set_reverb_sample(
-                self.get_reverb_offset(ReverbParam::IirDestB1)
-                    .wrapping_add(2),
-                iir_b1,
-                ram,
-            );
-
-            let acc_coef_a = self.get_reverb_coef(ReverbParam::AccCoefA);
-            let acc_coef_b = self.get_reverb_coef(ReverbParam::AccCoefB);
-            let acc_coef_c = self.get_reverb_coef(ReverbParam::AccCoefC);
-            let acc_coef_d = self.get_reverb_coef(ReverbParam::AccCoefD);
-
-            let acc0 = self.get_reverb_sample(self.get_reverb_offset(ReverbParam::AccSrcA0), ram)
-                * acc_coef_a
-                + self.get_reverb_sample(self.get_reverb_offset(ReverbParam::AccSrcB0), ram)
-                    * acc_coef_b
-                + self.get_reverb_sample(self.get_reverb_offset(ReverbParam::AccSrcC0), ram)
-                    * acc_coef_c
-                + self.get_reverb_sample(self.get_reverb_offset(ReverbParam::AccSrcD0), ram)
-                    * acc_coef_d;
-
-            let acc1 = self.get_reverb_sample(self.get_reverb_offset(ReverbParam::AccSrcA1), ram)
-                * acc_coef_a
-                + self.get_reverb_sample(self.get_reverb_offset(ReverbParam::AccSrcB1), ram)
-                    * acc_coef_b
-                + self.get_reverb_sample(self.get_reverb_offset(ReverbParam::AccSrcC1), ram)
-                    * acc_coef_c
-                + self.get_reverb_sample(self.get_reverb_offset(ReverbParam::AccSrcD1), ram)
-                    * acc_coef_d;
-
-            let fb_a0 = self.get_reverb_sample(
-                self.get_reverb_offset(ReverbParam::MixDestA0)
-                    .wrapping_sub(self.get_reverb_offset(ReverbParam::FbSrcA)),
-                ram,
-            );
-            let fb_a1 = self.get_reverb_sample(
-                self.get_reverb_offset(ReverbParam::MixDestA1)
-                    .wrapping_sub(self.get_reverb_offset(ReverbParam::FbSrcA)),
-                ram,
-            );
-            let fb_b0 = self.get_reverb_sample(
-                self.get_reverb_offset(ReverbParam::MixDestB0)
-                    .wrapping_sub(self.get_reverb_offset(ReverbParam::FbSrcB)),
-                ram,
-            );
-            let fb_b1 = self.get_reverb_sample(
-                self.get_reverb_offset(ReverbParam::MixDestB1)
-                    .wrapping_sub(self.get_reverb_offset(ReverbParam::FbSrcB)),
-                ram,
+            let comb_r = clamp16(
+                ((v_comb1
+                    * self.get_reverb_sample(self.get_reverb_offset(ReverbParam::AccSrcA1), ram))
+                    >> 15)
+                    + ((v_comb2
+                        * self.get_reverb_sample(
+                            self.get_reverb_offset(ReverbParam::AccSrcB1),
+                            ram,
+                        ))
+                        >> 15)
+                    + ((v_comb3
+                        * self.get_reverb_sample(
+                            self.get_reverb_offset(ReverbParam::AccSrcC1),
+                            ram,
+                        ))
+                        >> 15)
+                    + ((v_comb4
+                        * self.get_reverb_sample(
+                            self.get_reverb_offset(ReverbParam::AccSrcD1),
+                            ram,
+                        ))
+                        >> 15),
             );
 
-            let fb_alpha = self.get_reverb_coef(ReverbParam::FbAlpha);
-            let fb_x = self.get_reverb_coef(ReverbParam::FbX);
+            // Late reverb APF1 (cascaded into APF2).
+            let d_apf1 = self.get_reverb_offset(ReverbParam::FbSrcA);
+            let d_apf2 = self.get_reverb_offset(ReverbParam::FbSrcB);
+            let m_lapf1 = self.get_reverb_offset(ReverbParam::MixDestA0);
+            let m_rapf1 = self.get_reverb_offset(ReverbParam::MixDestA1);
+            let m_lapf2 = self.get_reverb_offset(ReverbParam::MixDestB0);
+            let m_rapf2 = self.get_reverb_offset(ReverbParam::MixDestB1);
+            let v_apf1 = self.get_reverb_coef(ReverbParam::FbAlpha);
+            let v_apf2 = self.get_reverb_coef(ReverbParam::FbX);
 
-            self.set_reverb_sample(
-                self.get_reverb_offset(ReverbParam::MixDestA0),
-                acc0 - fb_a0 * fb_alpha,
-                ram,
-            );
-            self.set_reverb_sample(
-                self.get_reverb_offset(ReverbParam::MixDestA1),
-                acc1 - fb_a1 * fb_alpha,
-                ram,
-            );
-            self.set_reverb_sample(
-                self.get_reverb_offset(ReverbParam::MixDestB0),
-                (fb_alpha * acc0) - fb_a0 * -fb_alpha - fb_b0 * fb_x,
-                ram,
-            );
-            self.set_reverb_sample(
-                self.get_reverb_offset(ReverbParam::MixDestB1),
-                (fb_alpha * acc1) - fb_a1 * -fb_alpha - fb_b1 * fb_x,
-                ram,
-            );
+            let fb_a0 = self.get_reverb_sample(m_lapf1 - d_apf1, ram);
+            let fb_a1 = self.get_reverb_sample(m_rapf1 - d_apf1, ram);
+            let apf1_l_in = clamp16(comb_l - ((v_apf1 * fb_a0) >> 15));
+            let apf1_r_in = clamp16(comb_r - ((v_apf1 * fb_a1) >> 15));
+            self.set_reverb_sample(m_lapf1, apf1_l_in, ram);
+            self.set_reverb_sample(m_rapf1, apf1_r_in, ram);
+            let apf1_l_out = clamp16(((v_apf1 * apf1_l_in) >> 15) + fb_a0);
+            let apf1_r_out = clamp16(((v_apf1 * apf1_r_in) >> 15) + fb_a1);
+
+            // Late reverb APF2.
+            let fb_b0 = self.get_reverb_sample(m_lapf2 - d_apf2, ram);
+            let fb_b1 = self.get_reverb_sample(m_rapf2 - d_apf2, ram);
+            let apf2_l_in = clamp16(apf1_l_out - ((v_apf2 * fb_b0) >> 15));
+            let apf2_r_in = clamp16(apf1_r_out - ((v_apf2 * fb_b1) >> 15));
+            self.set_reverb_sample(m_lapf2, apf2_l_in, ram);
+            self.set_reverb_sample(m_rapf2, apf2_r_in, ram);
+            let wet_22k_l = clamp16(((v_apf2 * apf2_l_in) >> 15) + fb_b0) as i16;
+            let wet_22k_r = clamp16(((v_apf2 * apf2_r_in) >> 15) + fb_b1) as i16;
+
+            self.reverb_out_pos = (self.reverb_out_pos + 1) & 31;
+            self.reverb_out_buf[0][self.reverb_out_pos] = wet_22k_l;
+            self.reverb_out_buf[1][self.reverb_out_pos] = wet_22k_r;
 
             self.reverb_curr_addr = self.reverb_curr_addr.wrapping_add(2);
             if self.reverb_curr_addr >= self.reverb_work_addr_end {
                 self.reverb_curr_addr = self.reverb_work_addr_start;
             }
-            self.reverb_cached_valid = false;
         }
 
-        if self.reverb_work_addr_start != 0 {
-            let [wet_l, wet_r] = if !is_odd && self.reverb_cached_valid {
-                self.reverb_cached_out
-            } else {
-                let evol_l = (self.reverb_vol_l as f32) / 32768.0;
-                let evol_r = (self.reverb_vol_r as f32) / 32768.0;
-                let sample_l = evol_l
-                    * (self.get_reverb_sample(self.get_reverb_offset(ReverbParam::MixDestA0), ram)
-                        + self.get_reverb_sample(
-                            self.get_reverb_offset(ReverbParam::MixDestB0),
-                            ram,
-                        ));
-                let sample_r = evol_r
-                    * (self.get_reverb_sample(self.get_reverb_offset(ReverbParam::MixDestA1), ram)
-                        + self.get_reverb_sample(
-                            self.get_reverb_offset(ReverbParam::MixDestB1),
-                            ram,
-                        ));
-                let out = [sample_l as i32, sample_r as i32];
-                if is_odd {
-                    self.reverb_cached_out = out;
-                    self.reverb_cached_valid = true;
-                }
-                out
-            };
-
-            *out_l = (wet_l + (*out_l as i32)).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-            *out_r = (wet_r + (*out_r as i32)).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        if unmuted {
+            let up_l = self.reverb_fir_upsample(0, is_odd);
+            let up_r = self.reverb_fir_upsample(1, is_odd);
+            let wet_l = (up_l * (self.reverb_vol_l as i32)) >> 15;
+            let wet_r = (up_r * (self.reverb_vol_r as i32)) >> 15;
+            *out_l = clamp16((*out_l as i32) + wet_l) as i16;
+            *out_r = clamp16((*out_r as i32) + wet_r) as i16;
         }
 
         self.reverb_ticks = self.reverb_ticks.wrapping_add(1);
@@ -2306,5 +2452,57 @@ mod tests {
             assert_eq!(outer_l, outer_r, "outer symmetry mismatch at step={step}");
             assert!(outer_l <= inner_l);
         }
+    }
+
+    #[test]
+    fn cxd2922q_gauss_per_term_shift_wrap_and_saturate() {
+        // Verify exact CXD2922Q silicon arithmetic: per-term >> 15, i16 wrapping_add
+        // on the first 3 terms, then saturating add of the 4th term.
+        let mut reader = SampleReader::new(0x80000);
+        reader.set_destination_sampling_rate(44_100);
+        reader.set_pitch(44_100, 0x1000);
+        reader.buffer[0] = -32768;
+        reader.buffer[1] = -32768;
+        reader.buffer[2] = -32768;
+        reader.buffer[3] = -32768;
+        reader.src_sample_idx = 0x0080; // gauss_idx = 8
+        let ram = vec![0u8; 0x80000];
+        let mut cache = SpuSampleCache::new(0x80000);
+        let mut irq = SpuIrqWatcher::new();
+        let got = reader.get_sample(None, &ram, &mut cache, &mut irq);
+
+        let gi = 8usize;
+        let s = -32768i32;
+        let expected = {
+            let out = (((GAUSS_TABLE[0x0FF - gi] * s) >> 15) as i16)
+                .wrapping_add(((GAUSS_TABLE[0x1FF - gi] * s) >> 15) as i16)
+                .wrapping_add(((GAUSS_TABLE[0x100 + gi] * s) >> 15) as i16)
+                as i32;
+            clamp16(out + ((GAUSS_TABLE[gi] * s) >> 15))
+        };
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn reverb_39tap_halfband_fir_unity_dc_gain() {
+        let mut base = SpuBase::new(0, 0x80000);
+        // Feed constant DC 16000 into the downsample ring buffer.
+        for _ in 0..64 {
+            base.reverb_in_pos = (base.reverb_in_pos + 1) & 63;
+            base.reverb_in_buf[0][base.reverb_in_pos] = 16_000;
+        }
+        let down = base.reverb_fir_downsample(0);
+        // Sum of all 39 taps = 0x7FFE / 0x8000 => 16000 * 32766 >> 15 = 15999.
+        assert_eq!(down, (16_000 * 0x7FFE) >> 15);
+
+        // Feed constant DC 16000 into the upsample ring buffer.
+        for _ in 0..32 {
+            base.reverb_out_pos = (base.reverb_out_pos + 1) & 31;
+            base.reverb_out_buf[0][base.reverb_out_pos] = 16_000;
+        }
+        let up_even = base.reverb_fir_upsample(0, false);
+        let up_odd = base.reverb_fir_upsample(0, true);
+        assert_eq!(up_even, 16_000);
+        assert_eq!(up_odd, (16_000 * 2 * 0x1FFF) >> 14);
     }
 }

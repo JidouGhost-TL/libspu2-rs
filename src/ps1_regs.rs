@@ -24,7 +24,7 @@ pub(crate) fn read_ps1_register(base: &SpuBase, offset: u32) -> Result<u16, Erro
             ps1::V_START_ADDR => (ch.address >> 3) as u16,
             ps1::V_ADSR1 => ch.adsr_level.raw(),
             ps1::V_ADSR2 => ch.adsr_rate.raw(),
-            ps1::V_ENVX => (ch.adsr_volume >> 16) as u16,
+            ps1::V_ENVX => ch.adsr_envx as u16,
             ps1::V_REPEAT_ADDR => (ch.repeat >> 3) as u16,
             _ => 0,
         });
@@ -42,8 +42,8 @@ pub(crate) fn read_ps1_register(base: &SpuBase, offset: u32) -> Result<u16, Erro
         return Ok(0);
     }
     Ok(match offset {
-        ps1::MVOLL => base.master_vol_l,
-        ps1::MVOLR => base.master_vol_r,
+        ps1::MVOLL => base.master_vol_l.raw(),
+        ps1::MVOLR => base.master_vol_r.raw(),
         ps1::EVOLL => base.reverb_vol_l as u16,
         ps1::EVOLR => base.reverb_vol_r as u16,
         ps1::PMON_LO => (base.channel_pmon() & 0xFFFF) as u16,
@@ -65,6 +65,9 @@ pub(crate) fn read_ps1_register(base: &SpuBase, offset: u32) -> Result<u16, Erro
             }
             if (base.control() & CONTROL_DMA) != 0 {
                 stat |= 0x80;
+            }
+            if base.capture_second_half() {
+                stat |= 0x0800;
             }
             stat
         }
@@ -105,7 +108,7 @@ pub(crate) fn write_ps1_register(
                 base.channel_mut(voice).adsr_rate = AdsrRate(value);
             }
             ps1::V_ENVX => {
-                base.channel_mut(voice).adsr_volume = (value as u32) << 16;
+                base.channel_mut(voice).adsr_envx = (value as i16) as i32;
             }
             ps1::V_REPEAT_ADDR => {
                 let ch = base.channel_mut(voice);
@@ -129,8 +132,8 @@ pub(crate) fn write_ps1_register(
         return Ok(());
     }
     match offset {
-        ps1::MVOLL => base.master_vol_l = value,
-        ps1::MVOLR => base.master_vol_r = value,
+        ps1::MVOLL => base.set_master_vol_l(value),
+        ps1::MVOLR => base.set_master_vol_r(value),
         ps1::EVOLL => base.set_reverb_vol_l(value as i16),
         ps1::EVOLR => base.set_reverb_vol_r(value as i16),
         ps1::KON_LO => base.send_key_on(value as u32),
@@ -143,11 +146,8 @@ pub(crate) fn write_ps1_register(
         ps1::NON_HI => base.set_channel_noise_hi(value),
         ps1::EON_LO => base.set_channel_reverb_lo(value),
         ps1::EON_HI => base.set_channel_reverb_hi(value),
-        ps1::ENDX_LO | ps1::ENDX_HI => {
-            if value != 0 {
-                base.clear_end_flags();
-            }
-        }
+        // PS1 ENDX is read-only; bits are cleared per-voice on KON.
+        ps1::ENDX_LO | ps1::ENDX_HI => {}
         ps1::RVB_WORK_ADDR => base.set_reverb_work_address_start((value as u32) << 3),
         ps1::IRQ_ADDR => base.set_irq_address((value as u32) << 3, irq_watcher),
         ps1::TRANSFER_ADDR => base.set_transfer_address((value as u32) << 3),

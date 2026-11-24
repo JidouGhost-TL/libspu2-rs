@@ -107,8 +107,11 @@ fn ps1_registers_reverb_transfer_irq_and_spustat() {
     assert_ne!(stat & 0x80, 0, "DMA bit should be set in SPUSTAT");
     assert_ne!(spu.read_ps1_register(ps1::ENDX_LO).unwrap() & 1, 0);
     assert_eq!(spu.read_ps1_register(ps1::ENDX_HI).unwrap(), 0);
+    // PS1 ENDX is read-only: writes are ignored; cleared per-voice on KON.
     spu.write_ps1_register(ps1::ENDX_LO, 0xFFFF).unwrap();
-    assert_eq!(spu.read_ps1_register(ps1::ENDX_LO).unwrap(), 0);
+    assert_ne!(spu.read_ps1_register(ps1::ENDX_LO).unwrap() & 1, 0);
+    spu.write_ps1_register(ps1::KON_LO, 0x0001).unwrap();
+    assert_eq!(spu.read_ps1_register(ps1::ENDX_LO).unwrap() & 1, 0);
     // Unknown PS1 offset returns 0 and ignores writes
     assert_eq!(spu.read_ps1_register(0x1F0).unwrap(), 0x0118); // inside RVB
     assert_eq!(spu.read_ps1_register(0x240).unwrap(), 0);
@@ -461,7 +464,10 @@ fn round2_polish_dma_straddle_wrap_ram_bounds_adsr_raw_and_output_rate() {
         .unwrap();
     wrap_dev.write_ram(0, &[0x11; 8]).unwrap();
     wrap_dev
-        .write_ps1_register(ps1::SPUCNT, registers::CONTROL_ENABLE)
+        .write_ps1_register(
+            ps1::SPUCNT,
+            registers::CONTROL_ENABLE | registers::CONTROL_UNMUTE,
+        )
         .unwrap();
     wrap_dev.write_ps1_register(ps1::V_VOLL, 0x3FFF).unwrap();
     wrap_dev.write_ps1_register(ps1::V_VOLR, 0x3FFF).unwrap();

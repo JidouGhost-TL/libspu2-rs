@@ -1,7 +1,7 @@
 # Voice with reverb send enabled; work area 0x180000..0x1FFFFF.
 reset
 ram_file 5000 data/sine440_loop.bin
-reg 0 19A 80C0
+reg 0 19A C0C0
 reg 0 2E0 000C
 reg 0 2E2 0000
 reg 0 33C 000F

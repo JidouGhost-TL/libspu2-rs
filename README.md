@@ -27,7 +27,7 @@ block[0] = 0x00; // shift 0, predictor 0
 block[1] = 0x03; // loop, no mute
 device.write_ram(0x5000, &block).unwrap();
 
-device.write_register(registers::CORE_ATTR, registers::CONTROL_ENABLE).unwrap();
+device.write_register(registers::CORE_ATTR, registers::CONTROL_ENABLE | registers::CONTROL_UNMUTE).unwrap();
 device.write_register(registers::VP_VOLL, 0x3FFF).unwrap();
 device.write_register(registers::VP_VOLR, 0x3FFF).unwrap();
 device.write_register(registers::VP_PITCH, 0x1000).unwrap();
