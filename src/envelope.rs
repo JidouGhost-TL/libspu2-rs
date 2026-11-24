@@ -433,6 +433,14 @@ pub(crate) fn compute_channel_volume(volume: ChannelVolume, current_volume: i32)
 /// (per Nocash PSX-SPX specification).
 #[inline]
 pub(crate) fn update_adsr(ch: &mut Channel) {
+    if ch.adsr_cycles > 1 {
+        ch.adsr_cycles -= 1;
+        return;
+    }
+    update_adsr_slow(ch);
+}
+
+fn update_adsr_slow(ch: &mut Channel) {
     let (shift, base_step, decreasing, exponential) = match ch.status {
         EnvelopePhase::Stopped | EnvelopePhase::KeyOn => return,
         EnvelopePhase::Attack => {

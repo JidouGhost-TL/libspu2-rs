@@ -60,4 +60,23 @@ impl NoiseGenerator {
             }
         }
     }
+
+    /// Advances the noise LFSR by `n` output sample ticks in O(1) divider steps.
+    #[inline]
+    pub(crate) fn step_n(&mut self, n: usize, div_inc: u32, cnt_inc: u32) {
+        let total_div = (self.divider as u64) + (n as u64) * (div_inc as u64);
+        let div_wraps = total_div >> 15;
+        self.divider = (total_div & 0x7FFF) as u32;
+        if div_wraps > 0 {
+            let total_cnt = (self.counter as u64) + div_wraps * (cnt_inc as u64);
+            let lfsr_ticks = total_cnt >> 3;
+            self.counter = (total_cnt & 7) as u32;
+            let mut l = self.level as u16;
+            for _ in 0..lfsr_ticks {
+                let parity = ((l >> 15) ^ (l >> 12) ^ (l >> 11) ^ (l >> 10) ^ 1) & 1;
+                l = (l << 1) | parity;
+            }
+            self.level = l as i16;
+        }
+    }
 }

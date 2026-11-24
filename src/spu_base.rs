@@ -5,7 +5,7 @@
 
 //! Core SPU/SPU2 synthesis engine (`Iop::CSpuBase` port).
 
-use crate::adpcm::{SampleReader, SpuSampleCache};
+use crate::adpcm::{SampleReader, SpuSampleCache, BUFFER_SAMPLES, PITCH_BASE};
 use crate::envelope::{
     compute_channel_volume, update_adsr, AdsrLevel, AdsrRate, Channel, ChannelVolume,
 };
@@ -19,6 +19,7 @@ use crate::reverb::{ReverbParam, ReverbState};
 
 pub(crate) const MAX_CHANNEL: usize = 24;
 pub(crate) const CONTROL_DMA: u16 = 0x0030;
+pub(crate) const CHUNK_FRAMES: usize = 256;
 
 const INIT_SAMPLE_RATE: u32 = 44_100;
 const TIME_SCALE: u32 = 0x1000;
@@ -37,15 +38,49 @@ const SOUND_INPUT_DATA_SAMPLES: u32 = 0x100;
 const DEFAULT_MASTER_VOL: u16 = 0x3FFF;
 const DEFAULT_REVERB_VOL: i16 = 0x2AAA;
 
+const ZERO_CHUNK: [i16; CHUNK_FRAMES] = [0; CHUNK_FRAMES];
+
 #[inline]
-pub(crate) const fn clamp16(v: i32) -> i32 {
-    if v < i16::MIN as i32 {
-        i16::MIN as i32
-    } else if v > i16::MAX as i32 {
-        i16::MAX as i32
-    } else {
-        v
+pub(crate) fn clamp16(v: i32) -> i32 {
+    v.clamp(i16::MIN as i32, i16::MAX as i32)
+}
+
+#[inline]
+fn linear_overlap(a0: u32, a1: u32, b0: u32, b1: u32) -> bool {
+    a0 < b1 && b0 < a1
+}
+
+/// Returns `true` if modular interval `[a_start, a_start + a_len)` overlaps
+/// `[b_start, b_start + b_len)` modulo power-of-two `ram_size`.
+#[inline]
+fn ranges_overlap_mod(a_start: u32, a_len: u32, b_start: u32, b_len: u32, ram_size: u32) -> bool {
+    if a_len == 0 || b_len == 0 {
+        return false;
     }
+    if a_len >= ram_size || b_len >= ram_size {
+        return true;
+    }
+    let mask = ram_size - 1;
+    let a0 = a_start & mask;
+    let a1 = a0 + a_len;
+    let b0 = b_start & mask;
+    let b1 = b0 + b_len;
+
+    let (a_hi, a_wrap) = if a1 <= ram_size {
+        (a1, 0)
+    } else {
+        (ram_size, a1 - ram_size)
+    };
+    let (b_hi, b_wrap) = if b1 <= ram_size {
+        (b1, 0)
+    } else {
+        (ram_size, b1 - ram_size)
+    };
+
+    linear_overlap(a0, a_hi, b0, b_hi)
+        || (a_wrap > 0 && linear_overlap(0, a_wrap, b0, b_hi))
+        || (b_wrap > 0 && linear_overlap(a0, a_hi, 0, b_wrap))
+        || (a_wrap > 0 && b_wrap > 0)
 }
 
 /// Shared per-core IRQ address watcher.
@@ -776,8 +811,93 @@ impl SpuBase {
         irq_watcher: &mut SpuIrqWatcher,
     ) {
         debug_assert!((samples.len() & 1) == 0);
-        let ticks = samples.len() / 2;
-        if ticks == 0 {
+        let mut buf_l = [0i16; CHUNK_FRAMES];
+        let mut buf_r = [0i16; CHUNK_FRAMES];
+        for chunk_out in samples.chunks_mut(CHUNK_FRAMES * 2) {
+            let n = chunk_out.len() / 2;
+            self.render_chunk_planar(&mut buf_l[..n], &mut buf_r[..n], ram, cache, irq_watcher);
+            for (dst, (&l, &r)) in chunk_out
+                .chunks_exact_mut(2)
+                .zip(buf_l[..n].iter().zip(&buf_r[..n]))
+            {
+                dst[0] = l;
+                dst[1] = r;
+            }
+        }
+    }
+
+    /// Renders `out_l.len()` stereo frames into planar `out_l` and `out_r` buffers.
+    pub(crate) fn render_planar(
+        &mut self,
+        out_l: &mut [i16],
+        out_r: &mut [i16],
+        ram: &mut [u8],
+        cache: &mut SpuSampleCache,
+        irq_watcher: &mut SpuIrqWatcher,
+    ) {
+        debug_assert_eq!(out_l.len(), out_r.len());
+        for (l_chunk, r_chunk) in out_l
+            .chunks_mut(CHUNK_FRAMES)
+            .zip(out_r.chunks_mut(CHUNK_FRAMES))
+        {
+            self.render_chunk_planar(l_chunk, r_chunk, ram, cache, irq_watcher);
+        }
+    }
+
+    fn voice_aliases_range(
+        &self,
+        voice: usize,
+        n: usize,
+        range_start: u32,
+        range_len: u32,
+    ) -> bool {
+        let ch = &self.channels[voice];
+        let reader = &self.readers[voice];
+        let max_step = if voice > 0 && ((self.channel_pmon & (1 << voice)) != 0) {
+            reader.step_for_pitch(self.base_sampling_rate, 0x3FFF)
+        } else {
+            reader.sample_step()
+        };
+        let block_span = (BUFFER_SAMPLES as u64) * (PITCH_BASE as u64);
+        let max_blocks = ((max_step as u64) * (n as u64) / block_span) + 4;
+        let max_bytes = max_blocks.saturating_mul(16).min(self.ram_size as u64) as u32;
+
+        if ranges_overlap_mod(
+            reader.next_sample_addr(),
+            max_bytes,
+            range_start,
+            range_len,
+            self.ram_size,
+        ) || ranges_overlap_mod(
+            reader.repeat_addr(),
+            max_bytes,
+            range_start,
+            range_len,
+            self.ram_size,
+        ) || ranges_overlap_mod(ch.repeat, max_bytes, range_start, range_len, self.ram_size)
+        {
+            return true;
+        }
+        if ch.status == EnvelopePhase::KeyOn
+            && ranges_overlap_mod(ch.address, max_bytes, range_start, range_len, self.ram_size)
+        {
+            return true;
+        }
+        false
+    }
+
+    fn render_chunk_planar(
+        &mut self,
+        dst_l: &mut [i16],
+        dst_r: &mut [i16],
+        ram: &mut [u8],
+        cache: &mut SpuSampleCache,
+        irq_watcher: &mut SpuIrqWatcher,
+    ) {
+        let n = dst_l.len();
+        debug_assert_eq!(n, dst_r.len());
+        debug_assert!(n <= CHUNK_FRAMES);
+        if n == 0 {
             return;
         }
 
@@ -789,7 +909,6 @@ impl SpuBase {
         let irq_enabled = (self.ctrl & CONTROL_IRQ) != 0;
         let unmuted = (self.ctrl & CONTROL_UNMUTE) != 0;
         let channel_reverb = self.channel_reverb();
-        let need_voice_out = self.channel_pmon != 0 || self.ps1_capture;
         let check_ps1_capture_irq = self.ps1_capture && irq_watcher.any_irq_below(0x1000);
         let (noise_div_inc, noise_cnt_inc) = NoiseGenerator::clock_increments(self.ctrl);
 
@@ -804,9 +923,13 @@ impl SpuBase {
         let mut master_l = self.master_vol_l_abs >> 16;
         let mut master_r = self.master_vol_r_abs >> 16;
 
+        let rev_start = self.reverb.work_address_start();
+        let rev_len = self.reverb.work_address_end().saturating_sub(rev_start);
+
         // Build active-voice bitmask; sync inert voices once outside the hot loop,
-        // and hoist reader repeat synchronization for active voices.
+        // hoist reader repeat synchronization, and check RAM aliasing for voice-outer safety.
         let mut active_mask = 0u32;
+        let mut need_frame_outer = false;
         for i in 0..MAX_CHANNEL {
             let ch = &mut self.channels[i];
             let reader = &mut self.readers[i];
@@ -827,7 +950,24 @@ impl SpuBase {
                 if !ch.volume_right.is_sweep() {
                     ch.volume_right_abs = ch.volume_right.fixed_volume_i32();
                 }
+                if ch.adsr_envx < 0 {
+                    need_frame_outer = true;
+                }
                 active_mask |= 1u32 << i;
+            }
+        }
+
+        if !need_frame_outer && active_mask != 0 && (self.ps1_capture || update_reverb) {
+            let mut m = active_mask;
+            while m != 0 {
+                let i = m.trailing_zeros() as usize;
+                m &= m - 1;
+                if (self.ps1_capture && self.voice_aliases_range(i, n, 0, 0x1000))
+                    || (update_reverb && self.voice_aliases_range(i, n, rev_start, rev_len))
+                {
+                    need_frame_outer = true;
+                    break;
+                }
             }
         }
 
@@ -838,9 +978,396 @@ impl SpuBase {
                 || (CORE1_SIN_LEFT..CORE1_SIN_LEFT + CORE0_OUTPUT_SIZE).contains(&self.irq_addr)
                 || (CORE1_SIN_RIGHT..CORE1_SIN_RIGHT + CORE0_OUTPUT_SIZE).contains(&self.irq_addr));
 
+        if need_frame_outer {
+            self.render_chunk_frame_outer(
+                dst_l,
+                dst_r,
+                active_mask,
+                update_reverb,
+                unmuted,
+                channel_reverb,
+                check_ps1_capture_irq,
+                check_core0_irq,
+                noise_div_inc,
+                noise_cnt_inc,
+                master_l_sweep,
+                master_r_sweep,
+                master_l,
+                master_r,
+                ram,
+                cache,
+                irq_watcher,
+            );
+        } else {
+            // Fast path: Voice-Outer, Frame-Inner 2-Pass Block Rendering.
+            dst_l.fill(0);
+            dst_r.fill(0);
+
+            let mut rev_l = [0i16; CHUNK_FRAMES];
+            let mut rev_r = [0i16; CHUNK_FRAMES];
+
+            let mut noise_buf = [0i16; CHUNK_FRAMES];
+            if (active_mask & self.channel_noise) != 0 {
+                for s in &mut noise_buf[..n] {
+                    *s = self.noise.level();
+                    self.noise.step(noise_div_inc, noise_cnt_inc);
+                }
+            } else {
+                self.noise.step_n(n, noise_div_inc, noise_cnt_inc);
+            }
+
+            let mut cap_v1 = [0i16; CHUNK_FRAMES];
+            let mut cap_v3 = [0i16; CHUNK_FRAMES];
+            let mut voice_tmp = [0i16; CHUNK_FRAMES];
+            let mut prev_voice_out = [0i16; CHUNK_FRAMES];
+            let mut prev_voice_idx: usize = MAX_CHANNEL;
+
+            let mut mask = active_mask;
+            while mask != 0 {
+                let i = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+
+                let use_pmon = i > 0 && ((self.channel_pmon & (1 << i)) != 0);
+                let use_noise = (self.channel_noise & (1 << i)) != 0;
+                let pmon_src: &[i16] = if use_pmon && prev_voice_idx == i - 1 {
+                    &prev_voice_out[..n]
+                } else {
+                    &ZERO_CHUNK[..n]
+                };
+
+                // Pass 1: Render voice `i` into `voice_tmp[..n]` using run-length inner loop.
+                {
+                    let ch = &mut self.channels[i];
+                    let reader = &mut self.readers[i];
+                    let base_rate = self.base_sampling_rate;
+                    const BLOCK_SPAN: u32 = (BUFFER_SAMPLES as u32) * PITCH_BASE;
+                    const MAX_FAST_STEP: u32 = ((BUFFER_SAMPLES - 1) as u32) * PITCH_BASE;
+
+                    let mut f = 0usize;
+                    while f < n {
+                        let remaining = n - f;
+                        let pos = reader.src_sample_idx();
+                        let step = reader.sample_step();
+                        let can_fast = !use_pmon
+                            && !use_noise
+                            && ch.status != EnvelopePhase::KeyOn
+                            && !reader.is_done()
+                            && !reader.did_change_repeat()
+                            && pos < BLOCK_SPAN
+                            && step < MAX_FAST_STEP;
+
+                        if can_fast {
+                            let until_blk = (BLOCK_SPAN - pos - 1)
+                                .checked_div(step)
+                                .map_or(remaining, |q| (q + 1) as usize);
+                            let until_adsr = if ch.status == EnvelopePhase::Stopped {
+                                remaining
+                            } else if ch.adsr_cycles > 1 {
+                                (ch.adsr_cycles - 1) as usize
+                            } else {
+                                0
+                            };
+                            let run = until_blk.min(until_adsr).min(remaining);
+                            if run > 1 {
+                                let envx = ch.adsr_envx;
+                                if envx == 0 {
+                                    voice_tmp[f..f + run].fill(0);
+                                    reader.set_src_sample_idx(
+                                        pos.wrapping_add(step.wrapping_mul(run as u32)),
+                                    );
+                                } else {
+                                    let buf = reader.buffer();
+                                    let mut cur_pos = pos;
+                                    for out in &mut voice_tmp[f..f + run] {
+                                        let sample = SampleReader::gaussian_sample(buf, cur_pos);
+                                        cur_pos = cur_pos.wrapping_add(step);
+                                        *out = (sample.wrapping_mul(envx) >> 15) as i16;
+                                    }
+                                    reader.set_src_sample_idx(cur_pos);
+                                }
+                                if ch.status != EnvelopePhase::Stopped {
+                                    ch.adsr_cycles -= run as i32;
+                                }
+                                f += run;
+                                continue;
+                            }
+                        }
+
+                        // Single-frame slow path (handles KeyOn, block wrap, ADSR tick, PMON, NON).
+                        if ch.status == EnvelopePhase::KeyOn {
+                            reader.set_params_read(ch.address, ch.repeat, ram, cache, irq_watcher);
+                            reader.clear_end_flag();
+                            ch.status = EnvelopePhase::Attack;
+                            ch.adsr_envx = 0;
+                            ch.adsr_cycles = 0;
+                            if reader.did_change_repeat() && !ch.repeat_set {
+                                ch.repeat = reader.repeat();
+                                reader.clear_did_change_repeat();
+                            }
+                        } else {
+                            if reader.is_done() {
+                                ch.status = EnvelopePhase::Stopped;
+                                ch.adsr_envx = 0;
+                                ch.adsr_cycles = 0;
+                                reader.clear_is_done();
+                            }
+                            if reader.did_change_repeat() {
+                                if !ch.repeat_set {
+                                    ch.repeat = reader.repeat();
+                                } else {
+                                    reader.set_repeat(ch.repeat);
+                                }
+                                reader.clear_did_change_repeat();
+                            }
+                        }
+
+                        let step_override = if use_pmon {
+                            let p_step = (ch.pitch as i16) as i32;
+                            let factor = (pmon_src[f] as i32) + 0x8000;
+                            let modulated_pitch =
+                                (((p_step * factor) >> 15) & 0xFFFF).min(0x3FFF) as u16;
+                            Some(reader.step_for_pitch(base_rate, modulated_pitch))
+                        } else {
+                            None
+                        };
+
+                        let adpcm_sample =
+                            reader.get_sample(step_override, ram, cache, irq_watcher);
+                        let read_sample = if use_noise {
+                            noise_buf[f] as i32
+                        } else {
+                            adpcm_sample
+                        };
+
+                        let envx = ch.adsr_envx;
+                        update_adsr(ch);
+                        voice_tmp[f] = (read_sample.wrapping_mul(envx) >> 15) as i16;
+                        f += 1;
+                    }
+                }
+
+                if self.ps1_capture {
+                    if i == 1 {
+                        cap_v1[..n].copy_from_slice(&voice_tmp[..n]);
+                    } else if i == 3 {
+                        cap_v3[..n].copy_from_slice(&voice_tmp[..n]);
+                    }
+                }
+
+                // Pass 2: Mix `voice_tmp[..n]` into dry/reverb planar accumulators.
+                let ch = &mut self.channels[i];
+                let rev_send = update_reverb && ((channel_reverb & (1 << i)) != 0);
+                if !ch.volume_left.is_sweep() && !ch.volume_right.is_sweep() {
+                    let vl = ch.volume_left_abs >> 16;
+                    let vr = ch.volume_right_abs >> 16;
+                    let src = &voice_tmp[..n];
+                    if unmuted {
+                        for k in 0..n {
+                            let s = src[k] as i32;
+                            dst_l[k] = ((s.wrapping_mul(vl) >> 15) + (dst_l[k] as i32))
+                                .clamp(i16::MIN as i32, i16::MAX as i32)
+                                as i16;
+                            dst_r[k] = ((s.wrapping_mul(vr) >> 15) + (dst_r[k] as i32))
+                                .clamp(i16::MIN as i32, i16::MAX as i32)
+                                as i16;
+                        }
+                    }
+                    if rev_send {
+                        let rl = &mut rev_l[..n];
+                        let rr = &mut rev_r[..n];
+                        for k in 0..n {
+                            let s = src[k] as i32;
+                            rl[k] = ((s.wrapping_mul(vl) >> 15) + (rl[k] as i32))
+                                .clamp(i16::MIN as i32, i16::MAX as i32)
+                                as i16;
+                            rr[k] = ((s.wrapping_mul(vr) >> 15) + (rr[k] as i32))
+                                .clamp(i16::MIN as i32, i16::MAX as i32)
+                                as i16;
+                        }
+                    }
+                } else {
+                    let sweep_l = ch.volume_left.is_sweep();
+                    let sweep_r = ch.volume_right.is_sweep();
+                    for k in 0..n {
+                        if sweep_l {
+                            ch.volume_left_abs =
+                                compute_channel_volume(ch.volume_left, ch.volume_left_abs);
+                        }
+                        if sweep_r {
+                            ch.volume_right_abs =
+                                compute_channel_volume(ch.volume_right, ch.volume_right_abs);
+                        }
+                        let s = voice_tmp[k] as i32;
+                        if s == 0 {
+                            continue;
+                        }
+                        let vl = ch.volume_left_abs >> 16;
+                        let vr = ch.volume_right_abs >> 16;
+                        if unmuted {
+                            Self::mix_samples(s, vl, &mut dst_l[k]);
+                            Self::mix_samples(s, vr, &mut dst_r[k]);
+                        }
+                        if rev_send {
+                            Self::mix_samples(s, vl, &mut rev_l[k]);
+                            Self::mix_samples(s, vr, &mut rev_r[k]);
+                        }
+                    }
+                }
+
+                if i + 1 < MAX_CHANNEL && ((self.channel_pmon & (1 << (i + 1))) != 0) {
+                    prev_voice_out[..n].copy_from_slice(&voice_tmp[..n]);
+                    prev_voice_idx = i;
+                }
+            }
+
+            if self.ps1_capture {
+                for k in 0..n {
+                    let off = self.capture_offset as usize;
+                    ram[off] = 0;
+                    ram[off + 1] = 0;
+                    ram[0x0400 + off] = 0;
+                    ram[0x0400 + off + 1] = 0;
+                    let b1 = cap_v1[k].to_le_bytes();
+                    ram[0x0800 + off] = b1[0];
+                    ram[0x0800 + off + 1] = b1[1];
+                    let b3 = cap_v3[k].to_le_bytes();
+                    ram[0x0C00 + off] = b3[0];
+                    ram[0x0C00 + off + 1] = b3[1];
+                    if check_ps1_capture_irq {
+                        irq_watcher.check_irq(off as u32);
+                        irq_watcher.check_irq((0x0400 + off) as u32);
+                        irq_watcher.check_irq((0x0800 + off) as u32);
+                        irq_watcher.check_irq((0x0C00 + off) as u32);
+                    }
+                    self.capture_offset = (self.capture_offset + 2) & (CAPTURE_BUFFER_SIZE - 2);
+                }
+                cache.clear_range(0, 0x1000);
+            }
+
+            if self.block_reader.can_read_samples()
+                || (self.block_write_ptr as usize == SOUND_INPUT_DATA_SIZE)
+            {
+                for k in 0..n {
+                    if !self.block_reader.can_read_samples()
+                        && (self.block_write_ptr as usize == SOUND_INPUT_DATA_SIZE)
+                    {
+                        let start = self.sound_input_data_addr as usize;
+                        self.block_reader
+                            .fill_block(&ram[start..start + SOUND_INPUT_DATA_SIZE]);
+                        self.block_write_ptr = 0;
+                    }
+                    if self.block_reader.can_read_samples() {
+                        let block_samples = self.block_reader.get_samples();
+                        if self.spu_number == 0 && self.block_reader.spdif_bypass() {
+                            Self::mix_samples(block_samples[0], 0x7FFF, &mut dst_l[k]);
+                            Self::mix_samples(block_samples[1], 0x7FFF, &mut dst_r[k]);
+                        } else {
+                            Self::mix_samples(block_samples[0], self.input_vol_l, &mut dst_l[k]);
+                            Self::mix_samples(block_samples[1], self.input_vol_r, &mut dst_r[k]);
+                        }
+                    }
+                }
+            }
+
+            if check_core0_irq {
+                for _ in 0..n {
+                    if self.irq_addr == (CORE0_SIN_LEFT + self.core0_output_offset)
+                        || self.irq_addr == (CORE1_SIN_LEFT + self.core0_output_offset)
+                        || self.irq_addr == (CORE1_SIN_RIGHT + self.core0_output_offset)
+                    {
+                        self.irq_pending = true;
+                    }
+                    self.core0_output_offset =
+                        self.core0_output_offset.wrapping_add(2) & (CORE0_OUTPUT_SIZE - 1);
+                }
+            }
+
+            if update_reverb {
+                for k in 0..n {
+                    self.reverb.update(
+                        [rev_l[k], rev_r[k]],
+                        unmuted,
+                        self.reverb_vol_l,
+                        self.reverb_vol_r,
+                        &mut dst_l[k],
+                        &mut dst_r[k],
+                        ram,
+                    );
+                }
+            }
+
+            if !master_l_sweep && !master_r_sweep {
+                for s in &mut dst_l[..n] {
+                    *s = Self::scale_master(*s, master_l);
+                }
+                for s in &mut dst_r[..n] {
+                    *s = Self::scale_master(*s, master_r);
+                }
+            } else {
+                for k in 0..n {
+                    if master_l_sweep {
+                        self.master_vol_l_abs =
+                            compute_channel_volume(self.master_vol_l, self.master_vol_l_abs);
+                        master_l = self.master_vol_l_abs >> 16;
+                    }
+                    if master_r_sweep {
+                        self.master_vol_r_abs =
+                            compute_channel_volume(self.master_vol_r, self.master_vol_r_abs);
+                        master_r = self.master_vol_r_abs >> 16;
+                    }
+                    dst_l[k] = Self::scale_master(dst_l[k], master_l);
+                    dst_r[k] = Self::scale_master(dst_r[k], master_r);
+                }
+            }
+        }
+
+        // Sync current ADPCM read addresses once after the chunk.
+        let mut mask = active_mask;
+        while mask != 0 {
+            let i = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            self.channels[i].current = self.readers[i].current();
+        }
+
+        if self.spu_number == 0 && !self.ps1_capture && !check_core0_irq {
+            self.core0_output_offset = self
+                .core0_output_offset
+                .wrapping_add((n as u32).wrapping_mul(2))
+                & (CORE0_OUTPUT_SIZE - 1);
+        }
+
+        if irq_enabled && irq_watcher.has_pending_irq(self.spu_number) {
+            self.irq_pending = true;
+        }
+        irq_watcher.clear_irq_pending(self.spu_number);
+    }
+
+    #[cold]
+    #[allow(clippy::too_many_arguments)]
+    fn render_chunk_frame_outer(
+        &mut self,
+        dst_l: &mut [i16],
+        dst_r: &mut [i16],
+        active_mask: u32,
+        update_reverb: bool,
+        unmuted: bool,
+        channel_reverb: u32,
+        check_ps1_capture_irq: bool,
+        check_core0_irq: bool,
+        noise_div_inc: u32,
+        noise_cnt_inc: u32,
+        master_l_sweep: bool,
+        master_r_sweep: bool,
+        mut master_l: i32,
+        mut master_r: i32,
+        ram: &mut [u8],
+        cache: &mut SpuSampleCache,
+        irq_watcher: &mut SpuIrqWatcher,
+    ) {
+        let need_voice_out = self.channel_pmon != 0 || self.ps1_capture;
         let mut voice_out = [0i16; MAX_CHANNEL];
 
-        for frame in samples.chunks_exact_mut(2) {
+        for k in 0..dst_l.len() {
             let mut out_l: i16 = 0;
             let mut out_r: i16 = 0;
             let mut reverb_sample = [0i16; 2];
@@ -870,6 +1397,7 @@ impl SpuBase {
                     if reader.is_done() {
                         ch.status = EnvelopePhase::Stopped;
                         ch.adsr_envx = 0;
+                        ch.adsr_cycles = 0;
                         reader.clear_is_done();
                     }
                     if reader.did_change_repeat() {
@@ -1010,29 +1538,9 @@ impl SpuBase {
                 master_r = self.master_vol_r_abs >> 16;
             }
 
-            frame[0] = Self::scale_master(out_l, master_l);
-            frame[1] = Self::scale_master(out_r, master_r);
+            dst_l[k] = Self::scale_master(out_l, master_l);
+            dst_r[k] = Self::scale_master(out_r, master_r);
         }
-
-        // Sync current ADPCM read addresses once after the frame loop.
-        let mut mask = active_mask;
-        while mask != 0 {
-            let i = mask.trailing_zeros() as usize;
-            mask &= mask - 1;
-            self.channels[i].current = self.readers[i].current();
-        }
-
-        if self.spu_number == 0 && !self.ps1_capture && !check_core0_irq {
-            self.core0_output_offset = self
-                .core0_output_offset
-                .wrapping_add((ticks as u32).wrapping_mul(2))
-                & (CORE0_OUTPUT_SIZE - 1);
-        }
-
-        if irq_enabled && irq_watcher.has_pending_irq(self.spu_number) {
-            self.irq_pending = true;
-        }
-        irq_watcher.clear_irq_pending(self.spu_number);
     }
 
     #[inline]

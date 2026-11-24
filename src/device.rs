@@ -10,7 +10,7 @@ use crate::adpcm::SpuSampleCache;
 use crate::inspect::VoiceState;
 use crate::ps1_regs;
 use crate::spu2::{self, Spu2};
-use crate::spu_base::{SpuBase, SpuIrqWatcher, MAX_CHANNEL};
+use crate::spu_base::{SpuIrqWatcher, CHUNK_FRAMES, MAX_CHANNEL};
 
 /// Number of SPU2 cores (`2`).
 pub const CORE_COUNT: usize = 2;
@@ -27,8 +27,6 @@ pub const REGISTER_SPACE_SIZE: u32 = 0x800;
 pub const PS1_RAM_SIZE: usize = 0x0008_0000;
 /// PS1 SPU native sample rate (`44100` Hz).
 pub const PS1_SAMPLE_RATE: u32 = 44_100;
-
-const CHUNK_FRAMES: usize = 256;
 
 /// Hardware operating mode of a [`Device`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -81,7 +79,8 @@ pub struct Device {
     irq_watcher: SpuIrqWatcher,
     spu2: Spu2,
     frame_counter: u64,
-    core1_buffer: [i16; CHUNK_FRAMES * 2],
+    core1_l: [i16; CHUNK_FRAMES],
+    core1_r: [i16; CHUNK_FRAMES],
 }
 
 impl fmt::Debug for Device {
@@ -127,7 +126,8 @@ impl Device {
             irq_watcher: SpuIrqWatcher::new(),
             spu2: Spu2::new(ram_size as u32),
             frame_counter: 0,
-            core1_buffer: [0i16; CHUNK_FRAMES * 2],
+            core1_l: [0i16; CHUNK_FRAMES],
+            core1_r: [0i16; CHUNK_FRAMES],
         };
         dev.reset();
         dev
@@ -350,6 +350,62 @@ impl Device {
         ))
     }
 
+    /// Renders `out_l.len()` stereo frames (`<= CHUNK_FRAMES`) into planar `out_l` / `out_r`.
+    fn render_chunk_planar(&mut self, out_l: &mut [i16], out_r: &mut [i16]) {
+        let chunk = out_l.len();
+        debug_assert_eq!(chunk, out_r.len());
+        debug_assert!(chunk <= CHUNK_FRAMES);
+
+        match self.mode {
+            DeviceMode::Ps1Spu => {
+                self.spu2.core_mut(0).base_mut().render_planar(
+                    out_l,
+                    out_r,
+                    &mut self.ram,
+                    &mut self.sample_cache,
+                    &mut self.irq_watcher,
+                );
+            }
+            DeviceMode::Spu2 => {
+                let (core0, core1) = self.spu2.cores_mut();
+                core0.base_mut().render_planar(
+                    out_l,
+                    out_r,
+                    &mut self.ram,
+                    &mut self.sample_cache,
+                    &mut self.irq_watcher,
+                );
+                let core1_enabled = core1.base().is_enabled();
+                if core1_enabled || !core1.base().is_completely_idle() {
+                    core1.base_mut().render_planar(
+                        &mut self.core1_l[..chunk],
+                        &mut self.core1_r[..chunk],
+                        &mut self.ram,
+                        &mut self.sample_cache,
+                        &mut self.irq_watcher,
+                    );
+                    core0.base_mut().latch_irq(&mut self.irq_watcher);
+                    if core1_enabled {
+                        let vol_l = core1.base().ext_input_vol_l;
+                        let vol_r = core1.base().ext_input_vol_r;
+                        for (dst, &src) in out_l.iter_mut().zip(&self.core1_l[..chunk]) {
+                            *dst = (((*dst as i32).wrapping_mul(vol_l) >> 15) + (src as i32))
+                                .clamp(i16::MIN as i32, i16::MAX as i32)
+                                as i16;
+                        }
+                        for (dst, &src) in out_r.iter_mut().zip(&self.core1_r[..chunk]) {
+                            *dst = (((*dst as i32).wrapping_mul(vol_r) >> 15) + (src as i32))
+                                .clamp(i16::MIN as i32, i16::MAX as i32)
+                                as i16;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.frame_counter += chunk as u64;
+    }
+
     /// Renders `interleaved_stereo.len() / 2` stereo frames into `interleaved_stereo`
     /// (`[L0, R0, L1, R1, ...]`).
     ///
@@ -362,70 +418,33 @@ impl Device {
             interleaved_stereo.len() % 2 == 0,
             "interleaved stereo buffer length must be even"
         );
+        let mut buf_l = [0i16; CHUNK_FRAMES];
+        let mut buf_r = [0i16; CHUNK_FRAMES];
         for out_slice in interleaved_stereo.chunks_mut(CHUNK_FRAMES * 2) {
-            let sample_count = out_slice.len();
-            let chunk = sample_count / 2;
-
-            match self.mode {
-                DeviceMode::Ps1Spu => {
-                    self.spu2.core_mut(0).base_mut().render(
-                        out_slice,
-                        &mut self.ram,
-                        &mut self.sample_cache,
-                        &mut self.irq_watcher,
-                    );
-                }
-                DeviceMode::Spu2 => {
-                    let (core0, core1) = self.spu2.cores_mut();
-                    core0.base_mut().render(
-                        out_slice,
-                        &mut self.ram,
-                        &mut self.sample_cache,
-                        &mut self.irq_watcher,
-                    );
-                    let core1_enabled = core1.base().is_enabled();
-                    if core1_enabled || !core1.base().is_completely_idle() {
-                        core1.base_mut().render(
-                            &mut self.core1_buffer[..sample_count],
-                            &mut self.ram,
-                            &mut self.sample_cache,
-                            &mut self.irq_watcher,
-                        );
-                        core0.base_mut().latch_irq(&mut self.irq_watcher);
-                        if core1_enabled {
-                            let vol_l = core1.base().ext_input_vol_l;
-                            let vol_r = core1.base().ext_input_vol_r;
-                            for (dst, src) in out_slice
-                                .chunks_exact_mut(2)
-                                .zip(self.core1_buffer[..sample_count].chunks_exact(2))
-                            {
-                                let mut mixed_l = src[0];
-                                let mut mixed_r = src[1];
-                                SpuBase::mix_samples(dst[0] as i32, vol_l, &mut mixed_l);
-                                SpuBase::mix_samples(dst[1] as i32, vol_r, &mut mixed_r);
-                                dst[0] = mixed_l;
-                                dst[1] = mixed_r;
-                            }
-                        }
-                    }
-                }
+            let chunk = out_slice.len() / 2;
+            self.render_chunk_planar(&mut buf_l[..chunk], &mut buf_r[..chunk]);
+            for (dst, (&l, &r)) in out_slice
+                .chunks_exact_mut(2)
+                .zip(buf_l[..chunk].iter().zip(&buf_r[..chunk]))
+            {
+                dst[0] = l;
+                dst[1] = r;
             }
-
-            self.frame_counter += chunk as u64;
         }
     }
 
     /// Renders stereo frames into a [`StereoI16`] slice.
     pub fn render_stereo(&mut self, frames: &mut [StereoI16]) {
-        let mut chunk_buf = [0i16; CHUNK_FRAMES * 2];
+        let mut buf_l = [0i16; CHUNK_FRAMES];
+        let mut buf_r = [0i16; CHUNK_FRAMES];
         for dst_chunk in frames.chunks_mut(CHUNK_FRAMES) {
-            let slice = &mut chunk_buf[..dst_chunk.len() * 2];
-            self.render_native(slice);
-            for (dst, src) in dst_chunk.iter_mut().zip(slice.chunks_exact(2)) {
-                *dst = StereoI16 {
-                    left: src[0],
-                    right: src[1],
-                };
+            let chunk = dst_chunk.len();
+            self.render_chunk_planar(&mut buf_l[..chunk], &mut buf_r[..chunk]);
+            for (dst, (&left, &right)) in dst_chunk
+                .iter_mut()
+                .zip(buf_l[..chunk].iter().zip(&buf_r[..chunk]))
+            {
+                *dst = StereoI16 { left, right };
             }
         }
     }
@@ -439,20 +458,19 @@ impl Device {
             return Err(Error::InvalidArgument("channel buffer lengths must match"));
         }
         const SCALE: f32 = 1.0 / 32768.0;
-        let mut chunk_buf = [0i16; CHUNK_FRAMES * 2];
+        let mut buf_l = [0i16; CHUNK_FRAMES];
+        let mut buf_r = [0i16; CHUNK_FRAMES];
         for (l_chunk, r_chunk) in left
             .chunks_mut(CHUNK_FRAMES)
             .zip(right.chunks_mut(CHUNK_FRAMES))
         {
-            let slice = &mut chunk_buf[..l_chunk.len() * 2];
-            self.render_native(slice);
-            for ((l, r), src) in l_chunk
-                .iter_mut()
-                .zip(r_chunk.iter_mut())
-                .zip(slice.chunks_exact(2))
-            {
-                *l = src[0] as f32 * SCALE;
-                *r = src[1] as f32 * SCALE;
+            let chunk = l_chunk.len();
+            self.render_chunk_planar(&mut buf_l[..chunk], &mut buf_r[..chunk]);
+            for (dst, &src) in l_chunk.iter_mut().zip(&buf_l[..chunk]) {
+                *dst = src as f32 * SCALE;
+            }
+            for (dst, &src) in r_chunk.iter_mut().zip(&buf_r[..chunk]) {
+                *dst = src as f32 * SCALE;
             }
         }
         Ok(())

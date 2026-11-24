@@ -110,10 +110,12 @@ impl ReverbParam {
     }
 }
 
-/// Symmetric half-band 39-tap FIR filter odd-offset coefficients (offsets ±19, ±17, ..., ±1).
+/// Symmetric half-band 39-tap FIR filter odd-offset coefficients (offsets -19, -17, ..., +17, +19)
+/// laid out contiguously for auto-vectorized 20-tap dot products (`pmaddwd`).
 /// Center tap (offset 0) is `0x4000`; all other even-offset taps are `0`.
-const REVERB_FIR_ODD_TAPS: [i32; 10] = [
-    -0x0001, 0x0002, -0x000A, 0x0023, -0x0067, 0x010A, -0x0268, 0x0534, -0x0B90, 0x2806,
+const REVERB_FIR_20_TAPS_I16: [i16; 20] = [
+    -0x0001, 0x0002, -0x000A, 0x0023, -0x0067, 0x010A, -0x0268, 0x0534, -0x0B90, 0x2806, 0x2806,
+    -0x0B90, 0x0534, -0x0268, 0x010A, -0x0067, 0x0023, -0x000A, 0x0002, -0x0001,
 ];
 const REVERB_FIR_CENTER_TAP: i32 = 0x4000;
 
@@ -127,14 +129,14 @@ const fn sub_mod(a: u32, b: u32, m: u32) -> u32 {
 }
 
 #[inline]
-const fn neg16(v: i32) -> i32 {
+fn neg16(v: i32) -> i32 {
     clamp16(-v)
 }
 
 /// Hardware IIR `(1 - IIR_ALPHA) * sample` term in Q14 (pre-`>> 1`).
 /// Handles `IIR_ALPHA == -32768` via saturating negation so `-(-32768) -> 0x7FFF`.
 #[inline]
-const fn reverb_iiasm(iir_alpha: i32, sample: i32) -> i32 {
+fn reverb_iiasm(iir_alpha: i32, sample: i32) -> i32 {
     (sample << 1) + ((sample * neg16(iir_alpha)) >> 14)
 }
 
@@ -163,30 +165,37 @@ pub(crate) struct ReverbState {
     work_addr_start: u32,
     work_addr_end: u32,
     curr_addr: u32,
+    rel: u32,
     ticks: i32,
     params: [u32; REVERB_PARAM_COUNT],
     reduced: [ChannelOffsets; 2],
     offsets_dirty: bool,
-    in_buf: [[i16; 64]; 2],
+    // Split-parity mirrored input ring buffers (32 * 2 = 64) for contiguous 20-tap SIMD.
+    in_even: [[i16; 64]; 2],
+    in_odd: [[i16; 64]; 2],
     in_pos: usize,
-    out_buf: [[i16; 32]; 2],
+    // Mirrored output ring buffer (32 * 2 = 64) for contiguous 20-tap SIMD.
+    out_buf: [[i16; 64]; 2],
     out_pos: [usize; 2],
 }
 
 impl ReverbState {
     pub(crate) fn new(ram_size: u32) -> Self {
+        debug_assert!(ram_size.is_power_of_two() && ram_size >= 2);
         Self {
             ram_size,
             work_addr_start: 0,
             work_addr_end: ram_size.min(0x80000),
             curr_addr: 0,
+            rel: 0,
             ticks: 0,
             params: [0; REVERB_PARAM_COUNT],
             reduced: [ChannelOffsets::default(); 2],
             offsets_dirty: true,
-            in_buf: [[0; 64]; 2],
+            in_even: [[0; 64]; 2],
+            in_odd: [[0; 64]; 2],
             in_pos: 0,
-            out_buf: [[0; 32]; 2],
+            out_buf: [[0; 64]; 2],
             out_pos: [0; 2],
         }
     }
@@ -195,13 +204,15 @@ impl ReverbState {
         self.work_addr_start = 0;
         self.work_addr_end = self.ram_size.min(0x80000);
         self.curr_addr = 0;
+        self.rel = 0;
         self.ticks = 0;
         self.params = [0; REVERB_PARAM_COUNT];
         self.reduced = [ChannelOffsets::default(); 2];
         self.offsets_dirty = true;
-        self.in_buf = [[0; 64]; 2];
+        self.in_even = [[0; 64]; 2];
+        self.in_odd = [[0; 64]; 2];
         self.in_pos = 0;
-        self.out_buf = [[0; 32]; 2];
+        self.out_buf = [[0; 64]; 2];
         self.out_pos = [0; 2];
     }
 
@@ -214,6 +225,7 @@ impl ReverbState {
     pub(crate) fn set_work_address_start(&mut self, address: u32) {
         self.work_addr_start = address;
         self.curr_addr = address;
+        self.rel = 0;
         self.offsets_dirty = true;
     }
 
@@ -306,6 +318,7 @@ impl ReverbState {
             fb_apf2: sub_mod(m_apf2_1, d_apf2, work_len),
         };
 
+        self.rel = self.current_rel(work_len);
         self.offsets_dirty = false;
     }
 
@@ -319,38 +332,95 @@ impl ReverbState {
     }
 
     #[inline]
-    fn ram_addr(&self, rel: u32, work_len: u32, reduced_offset: u32) -> usize {
+    fn ram_addr(
+        work_addr_start: u32,
+        rel: u32,
+        work_len: u32,
+        reduced_offset: u32,
+        even_mask: usize,
+    ) -> usize {
         let sum = rel + reduced_offset;
         let wrapped = if sum >= work_len { sum - work_len } else { sum };
-        ((self.work_addr_start + wrapped) & (self.ram_size - 1)) as usize
+        ((work_addr_start + wrapped) as usize) & even_mask
     }
 
     #[inline]
-    fn get_sample(&self, rel: u32, work_len: u32, reduced_offset: u32, ram: &[u8]) -> i32 {
-        let mask = (self.ram_size - 1) as usize;
-        let off = self.ram_addr(rel, work_len, reduced_offset);
-        i16::from_le_bytes([ram[off], ram[(off + 1) & mask]]) as i32
+    fn get_sample(
+        work_addr_start: u32,
+        rel: u32,
+        work_len: u32,
+        reduced_offset: u32,
+        even_mask: usize,
+        ram: &[u8],
+    ) -> i32 {
+        let off = Self::ram_addr(work_addr_start, rel, work_len, reduced_offset, even_mask);
+        i16::from_le_bytes([ram[off], ram[off + 1]]) as i32
     }
 
     #[inline]
-    fn set_sample(&self, rel: u32, work_len: u32, reduced_offset: u32, value: i32, ram: &mut [u8]) {
-        let mask = (self.ram_size - 1) as usize;
-        let off = self.ram_addr(rel, work_len, reduced_offset);
+    fn set_sample(
+        work_addr_start: u32,
+        rel: u32,
+        work_len: u32,
+        reduced_offset: u32,
+        even_mask: usize,
+        value: i32,
+        ram: &mut [u8],
+    ) {
+        let off = Self::ram_addr(work_addr_start, rel, work_len, reduced_offset, even_mask);
         let bytes = (clamp16(value) as i16).to_le_bytes();
         ram[off] = bytes[0];
-        ram[(off + 1) & mask] = bytes[1];
+        ram[off + 1] = bytes[1];
+    }
+
+    #[inline]
+    fn push_input(&mut self, l: i16, r: i16) {
+        self.in_pos = (self.in_pos + 1) & 63;
+        let p = self.in_pos >> 1;
+        if (self.in_pos & 1) != 0 {
+            self.in_odd[0][p] = l;
+            self.in_odd[0][p + 32] = l;
+            self.in_odd[1][p] = r;
+            self.in_odd[1][p + 32] = r;
+        } else {
+            self.in_even[0][p] = l;
+            self.in_even[0][p + 32] = l;
+            self.in_even[1][p] = r;
+            self.in_even[1][p + 32] = r;
+        }
+    }
+
+    #[inline]
+    fn push_output(&mut self, ch: usize, sample: i16) {
+        let p = (self.out_pos[ch] + 1) & 31;
+        self.out_pos[ch] = p;
+        self.out_buf[ch][p] = sample;
+        self.out_buf[ch][p + 32] = sample;
     }
 
     /// 39-tap symmetric half-band FIR downsample (44.1/48 kHz -> 22.05/24 kHz).
     #[inline]
     fn fir_downsample(&self, ch: usize) -> i32 {
-        let buf = &self.in_buf[ch];
-        let pos = self.in_pos;
-        let mut acc = REVERB_FIR_CENTER_TAP * (buf[pos.wrapping_sub(19) & 63] as i32);
-        for (j, &tap) in REVERB_FIR_ODD_TAPS.iter().enumerate() {
-            let a = buf[pos.wrapping_sub(38 - j * 2) & 63] as i32;
-            let b = buf[pos.wrapping_sub(j * 2) & 63] as i32;
-            acc += tap * (a + b);
+        let p = self.in_pos >> 1;
+        let is_odd = (self.in_pos & 1) != 0;
+        // Center tap is at (in_pos - 19), which has opposite parity to in_pos.
+        let center_idx = (self.in_pos.wrapping_sub(19) & 63) >> 1;
+        let center_sample = if is_odd {
+            self.in_even[ch][center_idx]
+        } else {
+            self.in_odd[ch][center_idx]
+        };
+        // Odd-offset taps (0, 2, ..., 38) all share parity with in_pos.
+        let buf = if is_odd {
+            &self.in_odd[ch]
+        } else {
+            &self.in_even[ch]
+        };
+        let start = p + 32 - 19;
+        let win: &[i16; 20] = buf[start..start + 20].try_into().unwrap();
+        let mut acc = REVERB_FIR_CENTER_TAP * (center_sample as i32);
+        for j in 0..20 {
+            acc += (REVERB_FIR_20_TAPS_I16[j] as i32) * (win[j] as i32);
         }
         clamp16(acc >> 15)
     }
@@ -358,26 +428,34 @@ impl ReverbState {
     /// 39-tap symmetric half-band zero-stuffed FIR upsample (22.05/24 kHz -> 44.1/48 kHz).
     #[inline]
     fn fir_upsample(&self, ch: usize, is_active: bool) -> i32 {
+        let p = self.out_pos[ch] & 31;
         let buf = &self.out_buf[ch];
-        let pos = self.out_pos[ch];
         if is_active {
+            let start = p + 32 - 19;
+            let win: &[i16; 20] = buf[start..start + 20].try_into().unwrap();
             let mut acc = 0i32;
-            for (j, &tap) in REVERB_FIR_ODD_TAPS.iter().enumerate() {
-                let a = buf[pos.wrapping_sub(19 - j) & 31] as i32;
-                let b = buf[pos.wrapping_sub(j) & 31] as i32;
-                acc += tap * (a + b);
+            for j in 0..20 {
+                acc += (REVERB_FIR_20_TAPS_I16[j] as i32) * (win[j] as i32);
             }
             clamp16(acc >> 14)
         } else {
-            buf[pos.wrapping_sub(9) & 31] as i32
+            buf[p + 32 - 9] as i32
         }
     }
 
     /// Runs one channel (0 = Left on odd cycles, 1 = Right on even cycles) of the
     /// hardware 16-bit fixed-point reverb engine.
     fn step_channel(&self, ch: usize, ram: &mut [u8]) -> i16 {
-        let work_len = self.work_addr_end - self.work_addr_start;
-        let rel = self.current_rel(work_len);
+        let ram = &mut ram[..self.ram_size as usize];
+        if ram.len() < 2 {
+            return 0;
+        }
+        // ram.len() is a power of two >= 2, so (ram.len() - 1) & !1 == ram.len() - 2.
+        // Masking with even_mask guarantees off <= ram.len() - 2, collapsing all bounds checks.
+        let even_mask = ram.len() - 2;
+        let work_start = self.work_addr_start;
+        let work_len = self.work_addr_end - work_start;
+        let rel = self.rel;
         let offs = self.reduced[ch];
 
         let in_s = self.fir_downsample(ch);
@@ -394,21 +472,43 @@ impl ReverbState {
 
         // Same-side reflection (IIR).
         let iir_in_same = clamp16(
-            (((self.get_sample(rel, work_len, offs.d_same, ram) * v_wall) >> 14) + in_term) >> 1,
+            (((Self::get_sample(work_start, rel, work_len, offs.d_same, even_mask, ram) * v_wall)
+                >> 14)
+                + in_term)
+                >> 1,
         );
-        let prev_same = self.get_sample(rel, work_len, offs.m_same_m2, ram);
+        let prev_same = Self::get_sample(work_start, rel, work_len, offs.m_same_m2, even_mask, ram);
         let iir_same =
             clamp16((((iir_in_same * v_iir) >> 14) + reverb_iiasm(v_iir, prev_same)) >> 1);
-        self.set_sample(rel, work_len, offs.m_same, iir_same, ram);
+        Self::set_sample(
+            work_start,
+            rel,
+            work_len,
+            offs.m_same,
+            even_mask,
+            iir_same,
+            ram,
+        );
 
         // Cross-coupled different-side reflection (IIR).
         let iir_in_diff = clamp16(
-            (((self.get_sample(rel, work_len, offs.d_diff, ram) * v_wall) >> 14) + in_term) >> 1,
+            (((Self::get_sample(work_start, rel, work_len, offs.d_diff, even_mask, ram) * v_wall)
+                >> 14)
+                + in_term)
+                >> 1,
         );
-        let prev_diff = self.get_sample(rel, work_len, offs.m_diff_m2, ram);
+        let prev_diff = Self::get_sample(work_start, rel, work_len, offs.m_diff_m2, even_mask, ram);
         let iir_diff =
             clamp16((((iir_in_diff * v_iir) >> 14) + reverb_iiasm(v_iir, prev_diff)) >> 1);
-        self.set_sample(rel, work_len, offs.m_diff, iir_diff, ram);
+        Self::set_sample(
+            work_start,
+            rel,
+            work_len,
+            offs.m_diff,
+            even_mask,
+            iir_diff,
+            ram,
+        );
 
         // Early echo (4-tap comb filter): unclamped Q14 accumulator folded directly into APF1.
         let v_comb1 = self.coef(ReverbParam::AccCoefA);
@@ -416,25 +516,30 @@ impl ReverbState {
         let v_comb3 = self.coef(ReverbParam::AccCoefC);
         let v_comb4 = self.coef(ReverbParam::AccCoefD);
 
-        let comb_acc = ((v_comb1 * self.get_sample(rel, work_len, offs.acc_a, ram)) >> 14)
-            + ((v_comb2 * self.get_sample(rel, work_len, offs.acc_b, ram)) >> 14)
-            + ((v_comb3 * self.get_sample(rel, work_len, offs.acc_c, ram)) >> 14)
-            + ((v_comb4 * self.get_sample(rel, work_len, offs.acc_d, ram)) >> 14);
+        let comb_acc = ((v_comb1
+            * Self::get_sample(work_start, rel, work_len, offs.acc_a, even_mask, ram))
+            >> 14)
+            + ((v_comb2 * Self::get_sample(work_start, rel, work_len, offs.acc_b, even_mask, ram))
+                >> 14)
+            + ((v_comb3 * Self::get_sample(work_start, rel, work_len, offs.acc_c, even_mask, ram))
+                >> 14)
+            + ((v_comb4 * Self::get_sample(work_start, rel, work_len, offs.acc_d, even_mask, ram))
+                >> 14);
 
         // Late reverb APF1 (cascaded into APF2).
         let v_apf1 = self.coef(ReverbParam::FbAlpha);
         let v_apf2 = self.coef(ReverbParam::FbX);
 
-        let fb_a = self.get_sample(rel, work_len, offs.fb_apf1, ram);
+        let fb_a = Self::get_sample(work_start, rel, work_len, offs.fb_apf1, even_mask, ram);
         let mda = clamp16((comb_acc + ((fb_a * neg16(v_apf1)) >> 14)) >> 1);
-        self.set_sample(rel, work_len, offs.m_apf1, mda, ram);
+        Self::set_sample(work_start, rel, work_len, offs.m_apf1, even_mask, mda, ram);
 
         let apf1_out_q14 = (fb_a << 1) + ((mda * v_apf1) >> 14);
 
         // Late reverb APF2.
-        let fb_b = self.get_sample(rel, work_len, offs.fb_apf2, ram);
+        let fb_b = Self::get_sample(work_start, rel, work_len, offs.fb_apf2, even_mask, ram);
         let mdb = clamp16((apf1_out_q14 + ((fb_b * neg16(v_apf2)) >> 14)) >> 1);
-        self.set_sample(rel, work_len, offs.m_apf2, mdb, ram);
+        Self::set_sample(work_start, rel, work_len, offs.m_apf2, even_mask, mdb, ram);
 
         clamp16(((fb_b << 1) + ((mdb * v_apf2) >> 14)) >> 1) as i16
     }
@@ -452,23 +557,24 @@ impl ReverbState {
         out_r: &mut i16,
         ram: &mut [u8],
     ) {
-        self.in_pos = (self.in_pos + 1) & 63;
-        self.in_buf[0][self.in_pos] = reverb_sample[0];
-        self.in_buf[1][self.in_pos] = reverb_sample[1];
+        self.push_input(reverb_sample[0], reverb_sample[1]);
 
         let is_odd = (self.ticks & 1) != 0;
         if is_odd {
             let wet_22k_l = self.step_channel(0, ram);
-            self.out_pos[0] = (self.out_pos[0] + 1) & 31;
-            self.out_buf[0][self.out_pos[0]] = wet_22k_l;
+            self.push_output(0, wet_22k_l);
         } else {
             let wet_22k_r = self.step_channel(1, ram);
-            self.out_pos[1] = (self.out_pos[1] + 1) & 31;
-            self.out_buf[1][self.out_pos[1]] = wet_22k_r;
+            self.push_output(1, wet_22k_r);
 
+            let work_len = self.work_addr_end - self.work_addr_start;
             self.curr_addr = self.curr_addr.wrapping_add(2);
+            self.rel += 2;
             if self.curr_addr >= self.work_addr_end {
                 self.curr_addr = self.work_addr_start;
+                self.rel = 0;
+            } else if self.rel >= work_len {
+                self.rel -= work_len;
             }
         }
 
@@ -498,8 +604,7 @@ mod tests {
         let mut rvb = ReverbState::new(0x80000);
         // Feed constant DC 16000 into the downsample ring buffer.
         for _ in 0..64 {
-            rvb.in_pos = (rvb.in_pos + 1) & 63;
-            rvb.in_buf[0][rvb.in_pos] = 16_000;
+            rvb.push_input(16_000, 0);
         }
         let down = rvb.fir_downsample(0);
         // Sum of all 39 taps = 0x7FFE / 0x8000 => 16000 * 32766 >> 15 = 15999.
@@ -507,8 +612,7 @@ mod tests {
 
         // Feed constant DC 16000 into the upsample ring buffer.
         for _ in 0..32 {
-            rvb.out_pos[0] = (rvb.out_pos[0] + 1) & 31;
-            rvb.out_buf[0][rvb.out_pos[0]] = 16_000;
+            rvb.push_output(0, 16_000);
         }
         let up_even = rvb.fir_upsample(0, false);
         let up_odd = rvb.fir_upsample(0, true);

@@ -11,8 +11,10 @@ use alloc::vec;
 use crate::spu_base::{clamp16, SpuIrqWatcher};
 
 pub(crate) const BUFFER_SAMPLES: usize = 28;
-const PITCH_BASE: u32 = 0x1000;
+pub(crate) const PITCH_BASE: u32 = 0x1000;
 const GAUSS_HISTORY: usize = 3;
+const BUFFER_ACTIVE_LEN: usize = GAUSS_HISTORY + BUFFER_SAMPLES * 2;
+pub(crate) const BUFFER_PADDED_LEN: usize = 68;
 
 const PREDICTOR_TABLE: [[i32; 2]; 16] = [
     [0, 0],
@@ -101,6 +103,22 @@ const GAUSS_TABLE: [i32; 512] = [
     0x593A, 0x5949, 0x5958, 0x5965, 0x5971, 0x597C, 0x5986, 0x598F,
     0x5997, 0x599E, 0x59A4, 0x59A9, 0x59AD, 0x59B0, 0x59B2, 0x59B3,
 ];
+
+/// Compile-time transposed 256x4 Gaussian interpolation LUT (contiguous 8-byte load per frac).
+pub(crate) const GAUSS_LUT: [[i16; 4]; 256] = {
+    let mut lut = [[0i16; 4]; 256];
+    let mut i = 0;
+    while i < 256 {
+        lut[i] = [
+            GAUSS_TABLE[0x0FF - i] as i16,
+            GAUSS_TABLE[0x1FF - i] as i16,
+            GAUSS_TABLE[0x100 + i] as i16,
+            GAUSS_TABLE[i] as i16,
+        ];
+        i += 1;
+    }
+    lut
+};
 
 const CACHE_SLOTS: usize = 1024;
 const CACHE_SLOT_MASK: usize = CACHE_SLOTS - 1;
@@ -270,7 +288,7 @@ pub(crate) struct SampleReader {
     next_sample_addr: u32,
     repeat_addr: u32,
     latched_repeat_addr: u32,
-    buffer: [i16; GAUSS_HISTORY + BUFFER_SAMPLES * 2],
+    buffer: [i16; BUFFER_PADDED_LEN],
     cur_meta: HalfBlockMeta,
     next_meta: HalfBlockMeta,
     s1: i32,
@@ -293,7 +311,7 @@ impl SampleReader {
             next_sample_addr: 0,
             repeat_addr: 0,
             latched_repeat_addr: 0,
-            buffer: [0; GAUSS_HISTORY + BUFFER_SAMPLES * 2],
+            buffer: [0; BUFFER_PADDED_LEN],
             cur_meta: HalfBlockMeta::default(),
             next_meta: HalfBlockMeta::default(),
             s1: 0,
@@ -309,7 +327,7 @@ impl SampleReader {
         self.next_sample_addr = 0;
         self.repeat_addr = 0;
         self.latched_repeat_addr = 0;
-        self.buffer = [0; GAUSS_HISTORY + BUFFER_SAMPLES * 2];
+        self.buffer = [0; BUFFER_PADDED_LEN];
         self.cur_meta = HalfBlockMeta::default();
         self.next_meta = HalfBlockMeta::default();
         self.src_sample_idx = 0;
@@ -369,7 +387,7 @@ impl SampleReader {
 
     pub(crate) fn set_params_no_read(&mut self, address: u32, repeat: u32) {
         self.set_params(address, repeat);
-        self.buffer = [0; GAUSS_HISTORY + BUFFER_SAMPLES * 2];
+        self.buffer = [0; BUFFER_PADDED_LEN];
     }
 
     pub(crate) fn set_pitch(&mut self, base_sampling_rate: u32, pitch: u16) {
@@ -401,6 +419,50 @@ impl SampleReader {
     }
 
     #[inline]
+    pub(crate) fn src_sample_idx(&self) -> u32 {
+        self.src_sample_idx
+    }
+
+    #[inline]
+    pub(crate) fn set_src_sample_idx(&mut self, idx: u32) {
+        self.src_sample_idx = idx;
+    }
+
+    #[inline]
+    pub(crate) fn sample_step(&self) -> u32 {
+        self.sample_step
+    }
+
+    #[inline]
+    pub(crate) fn buffer(&self) -> &[i16; BUFFER_PADDED_LEN] {
+        &self.buffer
+    }
+
+    #[inline]
+    pub(crate) fn next_sample_addr(&self) -> u32 {
+        self.next_sample_addr
+    }
+
+    #[inline]
+    pub(crate) fn repeat_addr(&self) -> u32 {
+        self.repeat_addr
+    }
+
+    /// Evaluates the hardware 4-tap Gaussian interpolation at `pos` (Q12) with zero bounds checks.
+    /// Mathematically proven to stay within `i16::MIN..=i16::MAX` (no `clamp16` required).
+    #[inline]
+    pub(crate) fn gaussian_sample(buffer: &[i16; BUFFER_PADDED_LEN], pos: u32) -> i32 {
+        let idx = ((pos >> 12) as usize) & 63;
+        let g = &GAUSS_LUT[((pos >> 4) & 0xFF) as usize];
+        let w = &buffer[idx..idx + 4];
+        ((g[0] as i32) * (w[0] as i32)
+            + (g[1] as i32) * (w[1] as i32)
+            + (g[2] as i32) * (w[2] as i32)
+            + (g[3] as i32) * (w[3] as i32))
+            >> 15
+    }
+
+    #[inline]
     pub(crate) fn get_sample(
         &mut self,
         step_override: Option<u32>,
@@ -408,36 +470,47 @@ impl SampleReader {
         cache: &mut SpuSampleCache,
         irq_watcher: &mut SpuIrqWatcher,
     ) -> i32 {
-        let src_sample_idx = (self.src_sample_idx / PITCH_BASE) as usize;
-        let gauss_idx = ((self.src_sample_idx >> 4) & 0xFF) as usize;
-        let window = &self.buffer[src_sample_idx..src_sample_idx + 4];
-        let s0 = window[0] as i32; // oldest
-        let s1 = window[1] as i32; // older
-        let s2 = window[2] as i32; // old
-        let s3 = window[3] as i32; // new
-        let g0 = GAUSS_TABLE[0x0FF - gauss_idx];
-        let g1 = GAUSS_TABLE[0x1FF - gauss_idx];
-        let g2 = GAUSS_TABLE[0x100 + gauss_idx];
-        let g3 = GAUSS_TABLE[gauss_idx];
-        // Hardware Gaussian interpolation: full-precision 4-tap MAC then >> 15.
-        let out = clamp16((g0 * s0 + g1 * s1 + g2 * s2 + g3 * s3) >> 15);
+        let pos = self.src_sample_idx;
+        let out = Self::gaussian_sample(&self.buffer, pos);
 
         let step = step_override.unwrap_or(self.sample_step);
-        let mut next_idx = (self.src_sample_idx as u64) + (step as u64);
-        let block_span = (BUFFER_SAMPLES as u64) * (PITCH_BASE as u64);
-        if src_sample_idx >= BUFFER_SAMPLES {
-            next_idx = next_idx.saturating_sub(block_span);
-            self.advance_buffer(ram, cache, irq_watcher);
+        let next_idx = (pos as u64) + (step as u64);
+        const BLOCK_SPAN: u64 = (BUFFER_SAMPLES as u64) * (PITCH_BASE as u64);
+        const MAX_VALID_IDX: u64 = ((BUFFER_SAMPLES * 2 - 1) as u64) * (PITCH_BASE as u64);
+
+        if (pos as u64) < BLOCK_SPAN && next_idx < MAX_VALID_IDX {
+            self.src_sample_idx = next_idx as u32;
+        } else {
+            self.advance_slow(pos, next_idx, ram, cache, irq_watcher);
         }
-        let max_valid_idx = ((BUFFER_SAMPLES * 2 - 1) as u64) * (PITCH_BASE as u64);
-        while next_idx >= max_valid_idx {
-            next_idx -= block_span;
-            self.advance_buffer(ram, cache, irq_watcher);
-        }
-        self.src_sample_idx = next_idx as u32;
         out
     }
 
+    #[cold]
+    #[inline(never)]
+    fn advance_slow(
+        &mut self,
+        pos: u32,
+        mut next_idx: u64,
+        ram: &[u8],
+        cache: &mut SpuSampleCache,
+        irq_watcher: &mut SpuIrqWatcher,
+    ) {
+        const BLOCK_SPAN: u64 = (BUFFER_SAMPLES as u64) * (PITCH_BASE as u64);
+        const MAX_VALID_IDX: u64 = ((BUFFER_SAMPLES * 2 - 1) as u64) * (PITCH_BASE as u64);
+        if (pos as u64) >= BLOCK_SPAN {
+            next_idx = next_idx.saturating_sub(BLOCK_SPAN);
+            self.advance_buffer(ram, cache, irq_watcher);
+        }
+        while next_idx >= MAX_VALID_IDX {
+            next_idx -= BLOCK_SPAN;
+            self.advance_buffer(ram, cache, irq_watcher);
+        }
+        self.src_sample_idx = next_idx as u32;
+    }
+
+    #[cold]
+    #[inline(never)]
     fn advance_buffer(
         &mut self,
         ram: &[u8],
@@ -453,7 +526,7 @@ impl SampleReader {
                 self.done = true;
             }
             self.buffer
-                .copy_within(BUFFER_SAMPLES..(GAUSS_HISTORY + BUFFER_SAMPLES * 2), 0);
+                .copy_within(BUFFER_SAMPLES..BUFFER_ACTIVE_LEN, 0);
             self.cur_meta = self.next_meta;
             if self.cur_meta.repeat_set {
                 self.latched_repeat_addr = self.cur_meta.repeat_addr;
